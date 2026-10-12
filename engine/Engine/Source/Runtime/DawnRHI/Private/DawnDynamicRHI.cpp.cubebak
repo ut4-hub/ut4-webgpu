@@ -1,0 +1,1514 @@
+#include "DawnDynamicRHI.h"
+#include "ShaderCore.h" // FShaderCodeReader (actual WGSL code size vs optional-data)
+#include "DawnCommandContext.h"
+#include "DawnResources.h"
+#include "RHICommandList.h"
+#include "RenderResource.h"
+#include "DataDrivenShaderPlatformInfo.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+
+DEFINE_LOG_CATEGORY(LogDawnRHI);
+
+// ============================================================================
+// Small helpers for constructing FRHITextureInitializer / FRHIBufferInitializer,
+// whose real constructors are `protected` and only reachable from a derived
+// type (this is the pattern the engine expects backends to use).
+// ============================================================================
+struct FDawnTextureInitializerHelper final : public FRHITextureInitializer
+{
+	FDawnTextureInitializerHelper(FRHICommandListBase& RHICmdList, FRHITexture* InTexture, FFinalizeCallback&& InFinalize,
+		FGetSubresourceCallback&& InGetSubresource = FGetSubresourceCallback{})
+		: FRHITextureInitializer(RHICmdList, InTexture, nullptr, 0, MoveTemp(InFinalize), MoveTemp(InGetSubresource))
+	{
+	}
+};
+
+struct FDawnBufferInitializerHelper final : public FRHIBufferInitializer
+{
+	FDawnBufferInitializerHelper(FRHICommandListBase& RHICmdList, FRHIBuffer* InBuffer, void* InWritableData, uint64 InWritableSize, FFinalizeCallback&& InFinalize)
+		: FRHIBufferInitializer(RHICmdList, InBuffer, InWritableData, InWritableSize, MoveTemp(InFinalize))
+	{
+	}
+};
+
+#if DAWNRHI_WASM
+#include <emscripten.h>
+#endif
+static void WaitForQueueIdle(WGPUInstance Instance, WGPUQueue Queue)
+{
+#if DAWNRHI_WASM
+	// On wasm the queue work-done callback does not fire during a synchronous
+	// game-thread wait (even with a JSPI yield), so blocking for GPU idle here
+	// deadlocks / stack-overflows the first frame. The browser synchronises GPU
+	// work at present time, so a CPU-side idle wait is unnecessary -- no-op it.
+	return;
+#endif
+	bool bDone = false;
+	WGPUQueueWorkDoneCallbackInfo CbInfo = {};
+	CbInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+	CbInfo.callback = [](WGPUQueueWorkDoneStatus, WGPUStringView, void* Userdata1, void*)
+	{
+		*reinterpret_cast<bool*>(Userdata1) = true;
+	};
+	CbInfo.userdata1 = &bDone;
+	WGPUFuture F = wgpuQueueOnSubmittedWorkDone(Queue, CbInfo);
+	(void)F;
+	for (int32 i = 0; i < 200000 && !bDone; ++i)
+	{
+#if DAWNRHI_WASM
+		// wgpuInstanceWaitAny does not yield to the browser event loop on wasm (no
+		// PROXY_TO_PTHREAD), so the AllowSpontaneous work-done callback never fires
+		// and this wait deadlocks. Yield via JSPI emscripten_sleep so the browser
+		// services the callback (same pattern the device acquisition uses).
+		emscripten_sleep(1);
+#else
+		WGPUFutureWaitInfo WaitInfo = {};
+		WaitInfo.future = F;
+		wgpuInstanceWaitAny(Instance, 1, &WaitInfo, 1000000 /* 1ms */);
+#endif
+	}
+}
+
+// ============================================================================
+// FDawnDynamicRHI
+// ============================================================================
+
+FDawnDynamicRHI::FDawnDynamicRHI()
+{
+}
+
+FDawnDynamicRHI::~FDawnDynamicRHI()
+{
+}
+
+#if DAWNRHI_WASM
+#include <emscripten.h>
+extern "C" WGPUDevice emscripten_webgpu_get_device(void);
+#endif
+
+static uint32 GDawnDeviceThreadId = 0;
+void FDawnDynamicRHI::InitDawnDevice()
+{
+#if !DAWNRHI_WASM
+	// Static linking of Dawn native requires installing the proc table
+	// ourselves — standard documented Dawn native usage (dawn/native/DawnNative.h),
+	// not anything SimplyStream-specific.
+	dawnProcSetProcs(&dawn::native::GetProcs());
+#endif
+
+	// Dawn requires explicitly opting in to finite-timeout wgpuInstanceWaitAny()
+	// calls via the TimedWaitAny instance feature (an unrequested instance
+	// otherwise only supports timeout==0 / timeout==UINT64_MAX waits, and
+	// finite polling waits fail with "Timeout waits are either not enabled
+	// or not supported"). We poll with short finite timeouts throughout this
+	// module (buffer-map / queue-idle waits), so request it up front.
+	//
+	// DAWNRHI_WASM: emdawnwebgpu's instance does not support requesting
+	// TimedWaitAny (DawnRHIWasmProbe's real_shader_wasm.cpp never requests
+	// it and never calls wgpuInstanceWaitAny at all — it is purely
+	// callback/event-loop driven, matching how every other wasm WebGPU
+	// binding works: JS promises only resolve between synchronous C/wasm
+	// calls yielding control back to the browser event loop, so a spin-wait
+	// inside wasm code would block that very event loop and deadlock
+	// instead of ever seeing the callback fire). Left unrequested here.
+	// TimedWaitAny is required for BOTH native (finite polling waits) AND wasm/emdawnwebgpu:
+	// emdawnwebgpu treats even UINT64_MAX as a finite timed wait (not the infinite sentinel), so
+	// wgpuInstanceWaitAny fails 'TimedWaitAny not enabled' without it. On wasm this is only
+	// serviceable because main() runs on a worker (PROXY_TO_PTHREAD): the worker blocks on the
+	// future's futex while the browser main thread services the WebGPU promise and signals it.
+#if DAWNRHI_WASM
+	// wasm/emdawnwebgpu, ASYNCIFY build: main2 runs on a worker and emdawnwebgpu
+	// WebGPU objects are per-thread with no cross-thread proxying, so we must
+	// acquire our OWN adapter+device on THIS thread. emdawnwebgpu rejects the
+	// TimedWaitAny feature, so below we pump this worker's event loop with
+	// emscripten_sleep (Asyncify) until the AllowSpontaneous callbacks fire
+	// instead of calling wgpuInstanceWaitAny.
+	WGPUInstanceDescriptor InstanceDesc = {};
+	Instance = wgpuCreateInstance(&InstanceDesc);
+	checkf(Instance, TEXT("DawnRHI: wgpuCreateInstance failed"));
+#else
+	WGPUInstanceFeatureName RequiredFeatures[] = { WGPUInstanceFeatureName_TimedWaitAny };
+	WGPUInstanceDescriptor InstanceDesc = {};
+	InstanceDesc.requiredFeatureCount = 1;
+	InstanceDesc.requiredFeatures = RequiredFeatures;
+	Instance = wgpuCreateInstance(&InstanceDesc);
+	checkf(Instance, TEXT("DawnRHI: wgpuCreateInstance failed"));
+#endif
+
+	WGPURequestAdapterOptions AdapterOpts = {};
+	AdapterOpts.powerPreference = WGPUPowerPreference_HighPerformance;
+#if !DAWNRHI_WASM
+	// The browser's WebGPU implementation picks its own backend (Vulkan/
+	// Metal/D3D12/ANGLE) internally; there is no such choice to make from
+	// wasm — DawnRHIWasmProbe's probes never set backendType and worked
+	// correctly against the real GPU via Chrome's own backend selection.
+	AdapterOpts.backendType = WGPUBackendType_Vulkan;
+#endif
+
+	WGPURequestAdapterCallbackInfo AdapterCbInfo = {};
+	AdapterCbInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+	AdapterCbInfo.callback = [](WGPURequestAdapterStatus Status, WGPUAdapter InAdapter, WGPUStringView Message, void* Userdata1, void*)
+	{
+		if (Status == WGPURequestAdapterStatus_Success)
+		{
+			*reinterpret_cast<WGPUAdapter*>(Userdata1) = InAdapter;
+		}
+		else
+		{
+			UE_LOG(LogDawnRHI, Error, TEXT("RequestAdapter failed: %.*s"), (int32)Message.length, ANSI_TO_TCHAR(Message.data));
+		}
+	};
+	AdapterCbInfo.userdata1 = &Adapter;
+	WGPUFuture AdapterFuture = wgpuInstanceRequestAdapter(Instance, &AdapterOpts, AdapterCbInfo);
+#if DAWNRHI_WASM
+	(void)AdapterFuture;
+	for (int32 SpinGuard = 0; !Adapter && SpinGuard < 2000; ++SpinGuard) { emscripten_sleep(5); }
+#else
+	WGPUFutureWaitInfo AdapterWait = {};
+	AdapterWait.future = AdapterFuture;
+	wgpuInstanceWaitAny(Instance, 1, &AdapterWait, UINT64_MAX);
+#endif
+	checkf(Adapter, TEXT("DawnRHI: no adapter"));
+
+	WGPUAdapterInfo Info = {};
+	wgpuAdapterGetInfo(Adapter, &Info);
+	UE_LOG(LogDawnRHI, Log, TEXT("DawnRHI adapter: %.*s / %.*s"),
+		(int32)Info.vendor.length, ANSI_TO_TCHAR(Info.vendor.data),
+		(int32)Info.device.length, ANSI_TO_TCHAR(Info.device.data));
+	wgpuAdapterInfoFreeMembers(Info);
+
+	WGPUDeviceDescriptor DeviceDesc = {};
+	DeviceDesc.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const*, WGPUErrorType Type, WGPUStringView Message, void*, void*)
+	{
+		UE_LOG(LogDawnRHI, Error, TEXT("Dawn uncaptured error (type %d): %.*s"), (int32)Type, (int32)Message.length, ANSI_TO_TCHAR(Message.data));
+	};
+	WGPURequestDeviceCallbackInfo DeviceCbInfo = {};
+	DeviceCbInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+	DeviceCbInfo.callback = [](WGPURequestDeviceStatus Status, WGPUDevice InDevice, WGPUStringView Message, void* Userdata1, void*)
+	{
+		if (Status == WGPURequestDeviceStatus_Success)
+		{
+			*reinterpret_cast<WGPUDevice*>(Userdata1) = InDevice;
+		}
+		else
+		{
+			UE_LOG(LogDawnRHI, Error, TEXT("RequestDevice failed: %.*s"), (int32)Message.length, ANSI_TO_TCHAR(Message.data));
+		}
+	};
+	DeviceCbInfo.userdata1 = &Device;
+	WGPUFuture DeviceFuture = wgpuAdapterRequestDevice(Adapter, &DeviceDesc, DeviceCbInfo);
+#if DAWNRHI_WASM
+	(void)DeviceFuture;
+	for (int32 SpinGuard = 0; !Device && SpinGuard < 2000; ++SpinGuard) { emscripten_sleep(5); }
+#else
+	WGPUFutureWaitInfo DeviceWait = {};
+	DeviceWait.future = DeviceFuture;
+	wgpuInstanceWaitAny(Instance, 1, &DeviceWait, UINT64_MAX);
+#endif
+	checkf(Device, TEXT("DawnRHI: no device"));
+
+	Queue = wgpuDeviceGetQueue(Device);
+	UE_LOG(LogDawnRHI, Warning, TEXT("DEVTHREAD: device acquired on thread=%u main=%d"), FPlatformTLS::GetCurrentThreadId(), (int32)IsInGameThread());
+	GDawnDeviceThreadId = FPlatformTLS::GetCurrentThreadId();
+}
+
+void FDawnDynamicRHI::Init()
+{
+	InitDawnDevice();
+	CommandContext = MakeUnique<FDawnCommandContext>(this);
+	GRHISupportsRHIThread = false;
+	GRHISupportsParallelRHIExecute = false;
+	GRHIAdapterName = TEXT("Dawn (Vulkan)");
+	GMaxRHIFeatureLevel = ERHIFeatureLevel::ES3_1;
+	// DawnRHI has no compute, but UE still computes dispatch configs (e.g. GPU-scene scatter
+	// in UpdateAllPrimitiveSceneInfos) on the CPU; an unset max-dispatch global asserts (div-by-0)
+	// -> OOB crash. Set a valid ceiling so the config math is well-formed (the dispatch is a no-op).
+	GRHIMaxDispatchThreadGroupsPerDimension = FIntVector(65535, 65535, 65535); // was SM6 (deferred); ES3_1 -> mobile forward renderer (its shaders cross-compile to WGSL; the deferred/compute set does not)
+	// Mark the formats DawnRHI can actually back as Supported, or
+	// RHICreateTexture's ValidateResourceDesc aborts ("pixel format ... not
+	// supported"). The scene depth buffer (PF_DepthStencil) is the first casualty.
+	{
+		const EPixelFormat _DawnSupported[] = {
+			PF_DepthStencil, PF_ShadowDepth, PF_D24, PF_R32_FLOAT,
+			PF_R8G8B8A8, PF_B8G8R8A8, PF_FloatRGBA, PF_FloatRGB, PF_FloatR11G11B10,
+			PF_G8, PF_A8, PF_R8, PF_R8G8, PF_R16F, PF_G16, PF_A2B10G10R10,
+			PF_R16_UINT, PF_R32_UINT, PF_R16G16B16A16_UINT, PF_R16G16B16A16_UNORM,
+			PF_A16B16G16R16, PF_R32G32B32A32_UINT, PF_G16R16, PF_G16R16F, PF_A32B32G32R32F
+		};
+		for (EPixelFormat _F : _DawnSupported) { GPixelFormats[_F].Supported = true; }
+	}
+	// SP_WEBGPU_SM5 is a DDPI-INI-registered name (no C++ enumerator); UE assigns
+	// it an EShaderPlatform value in the static-platform range (32..47) at startup.
+	// Resolve by name rather than hardcoding, so DataDrivenShaderPlatformInfo
+	// entries (IsValid, feature bits) and the cooked shader library both line up.
+	{
+		{
+			const TCHAR* P = TEXT("/Engine/Config/SimplyStream/DataDrivenPlatformInfo.ini");
+			const TCHAR* P2 = TEXT("/Engine/Platforms/SimplyStream/Config/DataDrivenPlatformInfo.ini");
+			FString Content;
+			const bool bExists = IFileManager::Get().FileExists(P);
+			const bool bExists2 = IFileManager::Get().FileExists(P2);
+			const bool bRead = FFileHelper::LoadFileToString(Content, P);
+			UE_LOG(LogDawnRHI, Warning, TEXT("DDPI diag: EngineConfigDir=%s"),
+				*FPaths::EngineConfigDir());
+			UE_LOG(LogDawnRHI, Warning, TEXT("DDPI diag: /Engine/Config exists=%d /Engine/Platforms exists=%d read=%d hasSM5=%d len=%d"),
+				(int)bExists, (int)bExists2, (int)bRead, (int)Content.Contains(TEXT("ShaderPlatform SP_WEBGPU_SM5")), Content.Len());
+		}
+		const EShaderPlatform WebGPUES31 = FGenericDataDrivenShaderPlatformInfo::GetShaderPlatformFromName(TEXT("SP_WEBGPU_ES31"));
+		UE_LOG(LogDawnRHI, Warning, TEXT("DawnRHI: SP_WEBGPU_ES31 resolved to %d (valid=%d)"),
+			(int32)WebGPUES31,
+			WebGPUES31 != SP_NumPlatforms ? (int32)FGenericDataDrivenShaderPlatformInfo::IsValid(WebGPUES31) : -1);
+		GMaxRHIShaderPlatform = (WebGPUES31 != SP_NumPlatforms) ? WebGPUES31 : (EShaderPlatform)43;
+		// Map the ES3_1 feature level to our WebGPU ES31 platform so GetFeatureLevelShaderPlatform()/
+		// the mobile renderer + global shader map all resolve to the cooked SP_WEBGPU_ES31 content.
+		GShaderPlatformForFeatureLevel[ERHIFeatureLevel::ES3_1] = GMaxRHIShaderPlatform;
+	}
+	// Bind the immediate command list's Graphics context now. Needed both by the
+	// RHIInit GetContext() validation right after this returns AND by the global
+	// render-resource creation below (which records via the immediate context).
+	FRHICommandListImmediate::Get().InitializeImmediateContexts();
+
+	// Initialize the global render resources (GWhiteTexture/GBlackTexture/etc.)
+	// exactly as every stock RHI backend does at the end of Init(). Without this,
+	// FSystemTextures::InitializeCommonTextures dereferences a null GWhiteTexture
+	// (its InitRHI never ran) and CreateRenderTarget faults.
+	FRenderResource::InitPreRHIResources();
+
+	GIsRHIInitialized = true;
+}
+
+void FDawnDynamicRHI::Shutdown()
+{
+	CommandContext.Reset();
+	if (Queue) { wgpuQueueRelease(Queue); Queue = nullptr; }
+	if (Device) { wgpuDeviceRelease(Device); Device = nullptr; }
+	if (Adapter) { wgpuAdapterRelease(Adapter); Adapter = nullptr; }
+	if (Instance) { wgpuInstanceRelease(Instance); Instance = nullptr; }
+}
+
+const TCHAR* FDawnDynamicRHI::GetName()
+{
+	return TEXT("Dawn");
+}
+
+FSamplerStateRHIRef FDawnDynamicRHI::RHICreateSamplerState(const FSamplerStateInitializerRHI& Initializer)
+{
+	FDawnSamplerState* State = new FDawnSamplerState(Initializer);
+
+	WGPUSamplerDescriptor Desc = {};
+	Desc.addressModeU = DawnAddressModeFromRHI((ESamplerAddressMode)Initializer.AddressU);
+	Desc.addressModeV = DawnAddressModeFromRHI((ESamplerAddressMode)Initializer.AddressV);
+	Desc.addressModeW = DawnAddressModeFromRHI((ESamplerAddressMode)Initializer.AddressW);
+	Desc.magFilter = DawnFilterModeFromRHI(Initializer.Filter);
+	Desc.minFilter = DawnFilterModeFromRHI(Initializer.Filter);
+	Desc.mipmapFilter = DawnMipFilterModeFromRHI(Initializer.Filter);
+	Desc.lodMinClamp = Initializer.MinMipLevel;
+	Desc.lodMaxClamp = Initializer.MaxMipLevel;
+	// WebGPU: maxAnisotropy>1 requires min/mag/mipmap filters all be Linear.
+	const bool bAllLinear = (Desc.magFilter == WGPUFilterMode_Linear && Desc.minFilter == WGPUFilterMode_Linear && Desc.mipmapFilter == WGPUMipmapFilterMode_Linear);
+	Desc.maxAnisotropy = bAllLinear ? (uint16)FMath::Max(1, Initializer.MaxAnisotropy) : (uint16)1;
+
+	State->Sampler = wgpuDeviceCreateSampler(Device, &Desc);
+	checkf(State->Sampler, TEXT("DawnRHI: sampler creation failed"));
+	return State;
+}
+
+FRasterizerStateRHIRef FDawnDynamicRHI::RHICreateRasterizerState(const FRasterizerStateInitializerRHI& Initializer)
+{
+	return new FDawnRasterizerState(Initializer);
+}
+
+FDepthStencilStateRHIRef FDawnDynamicRHI::RHICreateDepthStencilState(const FDepthStencilStateInitializerRHI& Initializer)
+{
+	return new FDawnDepthStencilState(Initializer);
+}
+
+FBlendStateRHIRef FDawnDynamicRHI::RHICreateBlendState(const FBlendStateInitializerRHI& Initializer)
+{
+	return new FDawnBlendState(Initializer);
+}
+
+FVertexDeclarationRHIRef FDawnDynamicRHI::RHICreateVertexDeclaration(const FVertexDeclarationElementList& Elements)
+{
+	return new FDawnVertexDeclaration(Elements);
+}
+
+static WGPUShaderModule CompileWGSL(WGPUDevice Device, const FRHICreateShaderDesc& CreateShaderDesc, const TCHAR* DebugLabel, bool bRemapPixelGroup = false)
+{
+	// Stage 1 shader contract (ours, not SimplyStream's): Code is UTF-8 WGSL
+	// source text. Stage 3 replaces the *producer* of this text (hand-authored
+	// -> HLSL->SPIR-V->WGSL via ShaderConductor+Tint) without changing this
+	// consumer. Pass the bytes straight through with an explicit length —
+	// no TCHAR round-trip, no reliance on WGPU_STRLEN's null-termination
+	// assumption (an earlier version round-tripped through FString/UTF8CHAR
+	// and fed Dawn's WGSL parser a corrupted/mis-terminated buffer).
+	WGPUShaderSourceWGSL WgslDesc = {};
+	WgslDesc.chain.sType = WGPUSType_ShaderSourceWGSL;
+	// Code.Num() is the FULL FShaderCode buffer = WGSL text + UE trailing optional-data
+	// blob. Feeding the whole thing to the WGSL parser makes it read garbage past the
+	// shader end ("invalid character found"). Use the actual code size (minus optional data).
+	FShaderCodeReader WgslCodeReader(CreateShaderDesc.Code);
+	const size_t WgslCodeLen = (size_t)WgslCodeReader.GetActualShaderCodeSize();
+	const char* WgslCodePtr = reinterpret_cast<const char*>(CreateShaderDesc.Code.GetData());
+	TArray<uint8> RemapBuf;
+	if (bRemapPixelGroup)
+	{
+		// Raw-byte @group(0)->@group(1) remap (same byte length; avoids a lossy TCHAR
+		// round-trip that corrupts the WGSL). Only the single digit after '(' changes.
+		RemapBuf.Append(reinterpret_cast<const uint8*>(WgslCodePtr), (int32)WgslCodeLen);
+		for (int32 i = 0; i + 8 < RemapBuf.Num(); )
+		{
+			if (RemapBuf[i] == (uint8)'@' && FMemory::Memcmp(&RemapBuf[i], "@group(0", 8) == 0 && (RemapBuf[i+8] == (uint8)')' || RemapBuf[i+8] == (uint8)'u'))
+			{
+				RemapBuf[i+7] = (uint8)'1';
+				i += 8;
+			}
+			else { ++i; }
+		}
+		WgslCodePtr = reinterpret_cast<const char*>(RemapBuf.GetData());
+	}
+	WgslDesc.code = { WgslCodePtr, WgslCodeLen };
+
+	WGPUShaderModuleDescriptor ModuleDesc = {};
+	ModuleDesc.nextInChain = &WgslDesc.chain;
+
+	auto LabelUtf8 = StringCast<UTF8CHAR>(DebugLabel);
+	ModuleDesc.label = { reinterpret_cast<const char*>(LabelUtf8.Get()), WGPU_STRLEN };
+
+	return wgpuDeviceCreateShaderModule(Device, &ModuleDesc);
+}
+
+// Milestone step 1/2: real cooked WGSL keeps the real UE shader's own entry
+// point name (e.g. "ScreenPassVS"/"CopyRectPS"), NOT the Stage 1 fixed
+// "vs_main"/"fs_main" convention (see FDawnVertexShader/FDawnPixelShader
+// ::EntryPoint in DawnResources.h). Scan for the real @vertex/@fragment
+// attribute's following "fn <Name>(" -- this is real WGSL grammar (the
+// attribute always immediately precedes the function it decorates), not a
+// guess. Falls back to the old fixed name if not found, so the still-
+// supported Stage 1/2 hand-authored WGSL paths (whose source has no
+// @vertex/@fragment attribute at all -- see GVertexWGSL/GPixelWGSL in
+// DawnRHITestMain.cpp) are unaffected.
+static FString ParseWgslEntryPoint(const FString& Wgsl, const TCHAR* Attribute, const TCHAR* FallbackName)
+{
+	int32 AttrIdx = Wgsl.Find(Attribute);
+	if (AttrIdx == INDEX_NONE)
+	{
+		return FallbackName;
+	}
+	int32 FnIdx = Wgsl.Find(TEXT("fn "), ESearchCase::CaseSensitive, ESearchDir::FromStart, AttrIdx);
+	if (FnIdx == INDEX_NONE)
+	{
+		return FallbackName;
+	}
+	int32 NameStart = FnIdx + 3;
+	int32 ParenIdx = Wgsl.Find(TEXT("("), ESearchCase::CaseSensitive, ESearchDir::FromStart, NameStart);
+	if (ParenIdx == INDEX_NONE || ParenIdx <= NameStart)
+	{
+		return FallbackName;
+	}
+	return Wgsl.Mid(NameStart, ParenIdx - NameStart).TrimStartAndEnd();
+}
+
+// Parse @group(G) @binding(B) var[<addrspace>] name : type; declarations out of the
+// cooked WGSL so the PSO bind-group layout matches EXACTLY what each shader declares
+// (the old fixed {UB@0,Tex@1,Sampler@2} table mismatched real Slate shaders -> Dawn
+// "Number of entries did not match" -> nothing drew). Runtime-side reflection; the
+// WGSL is well-formed tint output.
+static void ParseWgslBindings(const FString& Wgsl, TArray<FDawnShaderBinding>& Out)
+{
+	int32 Pos = 0;
+	while (true)
+	{
+		int32 G = Wgsl.Find(TEXT("@group("), ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos);
+		if (G == INDEX_NONE) { break; }
+		Pos = G + 7;
+		int32 GEnd = Wgsl.Find(TEXT(")"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Pos);
+		if (GEnd == INDEX_NONE) { break; }
+		const uint32 Group = (uint32)FCString::Atoi(*Wgsl.Mid(Pos, GEnd - Pos));
+		int32 B = Wgsl.Find(TEXT("@binding("), ESearchCase::CaseSensitive, ESearchDir::FromStart, GEnd);
+		if (B == INDEX_NONE) { break; }
+		int32 BStart = B + 9;
+		int32 BEnd = Wgsl.Find(TEXT(")"), ESearchCase::CaseSensitive, ESearchDir::FromStart, BStart);
+		if (BEnd == INDEX_NONE) { break; }
+		const uint32 Binding = (uint32)FCString::Atoi(*Wgsl.Mid(BStart, BEnd - BStart));
+		// Declaration body: from here to the next ';'.
+		int32 Semi = Wgsl.Find(TEXT(";"), ESearchCase::CaseSensitive, ESearchDir::FromStart, BEnd);
+		if (Semi == INDEX_NONE) { break; }
+		const FString Decl = Wgsl.Mid(BEnd, Semi - BEnd);
+		Pos = Semi;
+		EDawnShaderBindingKind Kind;
+		if (Decl.Contains(TEXT("texture_"), ESearchCase::CaseSensitive)) { Kind = EDawnShaderBindingKind::Texture; }
+		else if (Decl.Contains(TEXT(": sampler"), ESearchCase::CaseSensitive) || Decl.Contains(TEXT(":sampler"), ESearchCase::CaseSensitive) || Decl.Contains(TEXT("sampler_"), ESearchCase::CaseSensitive)) { Kind = EDawnShaderBindingKind::Sampler; }
+		else if (Decl.Contains(TEXT("var<uniform>"), ESearchCase::CaseSensitive)) { Kind = EDawnShaderBindingKind::UniformBuffer; }
+		else if (Decl.Contains(TEXT("var<storage"), ESearchCase::CaseSensitive)) { Kind = EDawnShaderBindingKind::UniformBuffer; }
+		else { continue; } // unknown resource kind at this group/binding - skip (don't fabricate)
+		bool bDup = false;
+		for (const FDawnShaderBinding& E : Out) { if (E.Group == Group && E.Binding == Binding) { bDup = true; break; } }
+		// Variable name: the identifier after 'var'/'var<...>' and before ':'.
+		FString VarName;
+		{
+			int32 VarPos = Decl.Find(TEXT("var"), ESearchCase::CaseSensitive);
+			if (VarPos != INDEX_NONE)
+			{
+				int32 Q = VarPos + 3;
+				if (Q < Decl.Len() && Decl[Q] == TEXT('<')) { int32 C = Decl.Find(TEXT(">"), ESearchCase::CaseSensitive, ESearchDir::FromStart, Q); if (C != INDEX_NONE) { Q = C + 1; } }
+				while (Q < Decl.Len() && FChar::IsWhitespace(Decl[Q])) { ++Q; }
+				int32 NameStart = Q;
+				while (Q < Decl.Len() && (FChar::IsAlnum(Decl[Q]) || Decl[Q] == TEXT('_'))) { ++Q; }
+				VarName = Decl.Mid(NameStart, Q - NameStart);
+			}
+		}
+		if (!bDup) { FDawnShaderBinding NB; NB.Group = Group; NB.Binding = Binding; NB.Kind = Kind; NB.Name = VarName; Out.Add(NB); }
+	}
+}
+
+FPixelShaderRHIRef FDawnDynamicRHI::RHICreatePixelShader(const FRHICreateShaderDesc& CreateShaderDesc)
+{
+	FDawnPixelShader* Shader = new FDawnPixelShader();
+	UE_LOG(LogDawnRHI, Warning, TEXT("PSNEW ptr=%p bindings=%d"), (void*)Shader, Shader->Bindings.Num());
+	{ FShaderCodeReader R(CreateShaderDesc.Code); Shader->WGSLSource = FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(CreateShaderDesc.Code.GetData()), (int32)R.GetActualShaderCodeSize()).Get(); }
+	// Remap the PS to @group(1) so its resources do NOT collide with the VS @group(0)
+	// @binding(0) (independent HLSL->WGSL compilation gives both stages a @group(0)
+	// @binding(0) uniform buffer; merged, the PS gamma overwrote the VS ViewProjection).
+	Shader->EntryPoint = ParseWgslEntryPoint(Shader->WGSLSource, TEXT("@fragment"), TEXT("fs_main"));
+	ParseWgslBindings(Shader->WGSLSource, Shader->Bindings);
+	Shader->ShaderModule = CompileWGSL(Device, CreateShaderDesc, TEXT("DawnRHI.PixelShader"));
+	checkf(Shader->ShaderModule, TEXT("DawnRHI: pixel shader WGSL compile failed"));
+	return Shader;
+}
+
+FVertexShaderRHIRef FDawnDynamicRHI::RHICreateVertexShader(const FRHICreateShaderDesc& CreateShaderDesc)
+{
+	FDawnVertexShader* Shader = new FDawnVertexShader();
+	UE_LOG(LogDawnRHI, Warning, TEXT("VSNEW ptr=%p bindings=%d"), (void*)Shader, Shader->Bindings.Num());
+	{ FShaderCodeReader R(CreateShaderDesc.Code); Shader->WGSLSource = FUTF8ToTCHAR(reinterpret_cast<const ANSICHAR*>(CreateShaderDesc.Code.GetData()), (int32)R.GetActualShaderCodeSize()).Get(); }
+	Shader->EntryPoint = ParseWgslEntryPoint(Shader->WGSLSource, TEXT("@vertex"), TEXT("vs_main"));
+	ParseWgslBindings(Shader->WGSLSource, Shader->Bindings);
+	Shader->ShaderModule = CompileWGSL(Device, CreateShaderDesc, TEXT("DawnRHI.VertexShader"));
+	checkf(Shader->ShaderModule, TEXT("DawnRHI: vertex shader WGSL compile failed"));
+	return Shader;
+}
+
+FGraphicsPipelineStateRHIRef FDawnDynamicRHI::RHICreateGraphicsPipelineState(const FGraphicsPipelineStateInitializer& Initializer)
+{
+	FDawnVertexShader* VS = static_cast<FDawnVertexShader*>(Initializer.BoundShaderState.VertexShaderRHI);
+	FDawnPixelShader* PS = static_cast<FDawnPixelShader*>(Initializer.BoundShaderState.PixelShaderRHI);
+	FDawnVertexDeclaration* VertexDecl = static_cast<FDawnVertexDeclaration*>(Initializer.BoundShaderState.VertexDeclarationRHI);
+	checkf(VS && PS, TEXT("DawnRHI: PSO requires vertex+pixel shaders (Stage 1 scope)"));
+	UE_LOG(LogDawnRHI, Warning, TEXT("PSOUSE vs=%p ps=%p vsB=%d psB=%d vsMod=%p psMod=%p vsSrc=%d"), (void*)VS, (void*)PS, VS->Bindings.Num(), PS->Bindings.Num(), (void*)VS->ShaderModule, (void*)PS->ShaderModule, VS->WGSLSource.Len());
+	{ FRHIVertexShader* VSb = Initializer.BoundShaderState.VertexShaderRHI; FRHIPixelShader* PSb = Initializer.BoundShaderState.PixelShaderRHI; UE_LOG(LogDawnRHI, Warning, TEXT("PSOFREQ vsFreq=%d psFreq=%d"), VSb?(int)VSb->GetFrequency():-1, PSb?(int)PSb->GetFrequency():-1); }
+
+	// Vertex buffer layout (single stream 0) derived from the vertex declaration.
+	TArray<WGPUVertexAttribute> Attributes;
+	uint64 Stride = 0;
+	if (VertexDecl)
+	{
+		for (const FVertexElement& Elem : VertexDecl->Elements)
+		{
+			WGPUVertexAttribute Attr = {};
+			Attr.format = DawnVertexFormatFromElementType((EVertexElementType)Elem.Type.GetValue());
+			Attr.offset = Elem.Offset;
+			Attr.shaderLocation = Elem.AttributeIndex;
+			Attributes.Add(Attr);
+			Stride = FMath::Max<uint64>(Stride, Elem.Stride);
+			{ static uint32 _vd=0; if(_vd++<24) UE_LOG(LogTemp, Warning, TEXT("VTXDIAG type=%d off=%u stride=%u attr=%u wgpufmt=%d"), (int)Elem.Type.GetValue(), (uint32)Elem.Offset, (uint32)Elem.Stride, (uint32)Elem.AttributeIndex, (int)Attr.format); }
+		}
+		{ static uint32 _vs=0; if(_vs++<6) UE_LOG(LogTemp, Warning, TEXT("VTXDIAG === computed arrayStride=%llu attrs=%d"), (unsigned long long)Stride, Attributes.Num()); }
+	}
+
+	WGPUVertexBufferLayout BufferLayout = {};
+	BufferLayout.arrayStride = Stride;
+	BufferLayout.stepMode = WGPUVertexStepMode_Vertex;
+	BufferLayout.attributeCount = Attributes.Num();
+	BufferLayout.attributes = Attributes.GetData();
+
+	// Blend state: WITHOUT this ColorTarget.blend stays null -> opaque write, so
+	// any alpha-blended draw (Slate text emits rgb=white, alpha=glyph-coverage) loses
+	// its coverage and paints solid white quads. Translate the RHI blend state
+	// (Initializer.BlendState -> FDawnBlendState) to a WGPUBlendState. Opaque states
+	// (One/Zero/Add) round-trip to an equivalent no-op blend, so always set it.
+	auto ToWgpuFactor = [](EBlendFactor F) -> WGPUBlendFactor
+	{
+		switch (F)
+		{
+		case BF_Zero:                      return WGPUBlendFactor_Zero;
+		case BF_One:                       return WGPUBlendFactor_One;
+		case BF_SourceColor:               return WGPUBlendFactor_Src;
+		case BF_InverseSourceColor:        return WGPUBlendFactor_OneMinusSrc;
+		case BF_SourceAlpha:               return WGPUBlendFactor_SrcAlpha;
+		case BF_InverseSourceAlpha:        return WGPUBlendFactor_OneMinusSrcAlpha;
+		case BF_DestAlpha:                 return WGPUBlendFactor_DstAlpha;
+		case BF_InverseDestAlpha:          return WGPUBlendFactor_OneMinusDstAlpha;
+		case BF_DestColor:                 return WGPUBlendFactor_Dst;
+		case BF_InverseDestColor:          return WGPUBlendFactor_OneMinusDst;
+		case BF_ConstantBlendFactor:       return WGPUBlendFactor_Constant;
+		case BF_InverseConstantBlendFactor:return WGPUBlendFactor_OneMinusConstant;
+		case BF_Source1Color:              return WGPUBlendFactor_Src1;
+		case BF_InverseSource1Color:       return WGPUBlendFactor_OneMinusSrc1;
+		case BF_Source1Alpha:              return WGPUBlendFactor_Src1Alpha;
+		case BF_InverseSource1Alpha:       return WGPUBlendFactor_OneMinusSrc1Alpha;
+		default:                           return WGPUBlendFactor_One;
+		}
+	};
+	auto ToWgpuOp = [](EBlendOperation O) -> WGPUBlendOperation
+	{
+		switch (O)
+		{
+		case BO_Add:             return WGPUBlendOperation_Add;
+		case BO_Subtract:        return WGPUBlendOperation_Subtract;
+		case BO_ReverseSubtract: return WGPUBlendOperation_ReverseSubtract;
+		case BO_Min:             return WGPUBlendOperation_Min;
+		case BO_Max:             return WGPUBlendOperation_Max;
+		default:                 return WGPUBlendOperation_Add;
+		}
+	};
+	FBlendStateInitializerRHI::FRenderTarget RT0;
+	if (FDawnBlendState* BS = static_cast<FDawnBlendState*>(Initializer.BlendState))
+	{
+		RT0 = BS->Initializer.RenderTargets[0];
+	}
+	WGPUBlendState BlendState = {};
+	BlendState.color.operation = ToWgpuOp(RT0.ColorBlendOp);
+	BlendState.color.srcFactor = ToWgpuFactor(RT0.ColorSrcBlend);
+	BlendState.color.dstFactor = ToWgpuFactor(RT0.ColorDestBlend);
+	BlendState.alpha.operation = ToWgpuOp(RT0.AlphaBlendOp);
+	BlendState.alpha.srcFactor = ToWgpuFactor(RT0.AlphaSrcBlend);
+	BlendState.alpha.dstFactor = ToWgpuFactor(RT0.AlphaDestBlend);
+	WGPUColorWriteMask WriteMask = WGPUColorWriteMask_None;
+	if (RT0.ColorWriteMask & CW_RED)   { WriteMask |= WGPUColorWriteMask_Red; }
+	if (RT0.ColorWriteMask & CW_GREEN) { WriteMask |= WGPUColorWriteMask_Green; }
+	if (RT0.ColorWriteMask & CW_BLUE)  { WriteMask |= WGPUColorWriteMask_Blue; }
+	if (RT0.ColorWriteMask & CW_ALPHA) { WriteMask |= WGPUColorWriteMask_Alpha; }
+	{ static uint32 _bd=0; if(_bd++<8) UE_LOG(LogDawnRHI, Warning, TEXT("BLENDDIAG cOp=%d cSrc=%d cDst=%d aSrc=%d aDst=%d mask=%d"), (int)RT0.ColorBlendOp, (int)RT0.ColorSrcBlend, (int)RT0.ColorDestBlend, (int)RT0.AlphaSrcBlend, (int)RT0.AlphaDestBlend, (int)RT0.ColorWriteMask); }
+
+	WGPUColorTargetState ColorTarget = {};
+	ColorTarget.format = DawnTextureFormatFromPixelFormat((EPixelFormat)Initializer.RenderTargetFormats[0]);
+	ColorTarget.writeMask = WriteMask;
+	ColorTarget.blend = &BlendState;
+
+	WGPUFragmentState FragState = {};
+	FragState.module = PS->ShaderModule;
+	auto FsEntry = StringCast<UTF8CHAR>(*PS->EntryPoint);
+	FragState.entryPoint = { reinterpret_cast<const char*>(FsEntry.Get()), (size_t)FsEntry.Length() };
+	FragState.targetCount = 1;
+	FragState.targets = &ColorTarget;
+
+	// Milestone step 1 (+ this session's multi-@group fix): reflection-driven
+	// bind group layout(s), one WGPUBindGroupLayout PER real reflected
+	// FDawnShaderBinding::Group value (not just @group(0) — see the NOTE on
+	// FDawnGraphicsPipelineState::BindGroupLayouts in DawnResources.h for why
+	// this changed and what's actually been exercised by real content so
+	// far). If either shader carries real reflected bindings
+	// (FDawnVertexShader/FDawnPixelShader::Bindings, populated from the real
+	// cooked SPIR-V — see DawnResources.h/DawnShaderCompiler.cpp), build the
+	// layout(s) from THAT (real @group/@binding numbers, real resource
+	// kinds) instead of the old fixed {UB@0,Texture@1,Sampler@2} table.
+	// Falls back to the fixed single-@group(0) table only when neither
+	// shader has reflection data — the Stage 1/2 hand-authored WGSL test
+	// paths (DawnRHITestMain's synthetic scene_vs/scene_ps) still rely on
+	// that fixed convention by construction and never populate ::Bindings.
+	TMap<uint32, TArray<WGPUBindGroupLayoutEntry>> EntriesByGroup;
+	auto AppendShaderBindings = [&EntriesByGroup](const TArray<FDawnShaderBinding>& Bindings, WGPUShaderStage Stage)
+	{
+		for (const FDawnShaderBinding& B : Bindings)
+		{
+			TArray<WGPUBindGroupLayoutEntry>& LayoutEntries = EntriesByGroup.FindOrAdd(B.Group);
+
+			// Multiple shader stages can reflect the SAME @group/@binding
+			// (e.g. a uniform buffer read by both VS and PS) — merge visibility
+			// instead of adding a duplicate WGPUBindGroupLayoutEntry (Dawn
+			// rejects a layout with two entries at the same binding number).
+			bool bMerged = false;
+			for (WGPUBindGroupLayoutEntry& Existing : LayoutEntries)
+			{
+				if (Existing.binding == B.Binding)
+				{
+					Existing.visibility |= Stage;
+					bMerged = true;
+					break;
+				}
+			}
+			if (bMerged)
+			{
+				continue;
+			}
+			WGPUBindGroupLayoutEntry Entry = {};
+			Entry.binding = B.Binding;
+			Entry.visibility = Stage;
+			switch (B.Kind)
+			{
+			case EDawnShaderBindingKind::UniformBuffer:
+				Entry.buffer.type = WGPUBufferBindingType_Uniform;
+				break;
+			case EDawnShaderBindingKind::Texture:
+				Entry.texture.sampleType = WGPUTextureSampleType_Float;
+				Entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+				break;
+			case EDawnShaderBindingKind::Sampler:
+				Entry.sampler.type = WGPUSamplerBindingType_Filtering;
+				break;
+			default:
+				continue; // unclassified resource kind — do not fabricate a layout entry
+			}
+			LayoutEntries.Add(Entry);
+		}
+	};
+	// TEST (2026-08-15): shader reflection was never implemented (Bindings is
+	// never populated) yet it reads as a garbage Num() -> forcing the intended
+	// fixed {UB@0,Tex@1,Sampler@2} fallback. If this renders, garbage Bindings
+	// was the sole blocker; if it still crashes, corruption is broader.
+	AppendShaderBindings(VS->Bindings, WGPUShaderStage_Vertex);
+	AppendShaderBindings(PS->Bindings, WGPUShaderStage_Fragment);
+	{ static uint32 _vb=0; if(_vb++<3){ for(const FDawnShaderBinding&B:VS->Bindings) UE_LOG(LogTemp, Warning, TEXT("VBIND vs grp=%u bind=%u kind=%d"), B.Group, B.Binding, (int)B.Kind); for(const FDawnShaderBinding&B:PS->Bindings) UE_LOG(LogTemp, Warning, TEXT("VBIND ps grp=%u bind=%u kind=%d"), B.Group, B.Binding, (int)B.Kind); } }
+	UE_LOG(LogDawnRHI, Warning, TEXT("PSODIAG vsB=%d psB=%d groups=%d"), VS->Bindings.Num(), PS->Bindings.Num(), EntriesByGroup.Num());
+	for (const TPair<uint32, TArray<WGPUBindGroupLayoutEntry>>& P : EntriesByGroup) { for (const WGPUBindGroupLayoutEntry& E : P.Value) { UE_LOG(LogDawnRHI, Warning, TEXT("PSODIAG   grp=%u binding=%u"), P.Key, E.binding); } }
+
+	if (EntriesByGroup.Num() == 0)
+	{
+		// No reflection data on either shader — fall back to Stage 2's
+		// original fixed convention (see the NOTE on
+		// FDawnGraphicsPipelineState::BindGroupLayouts in DawnResources.h).
+		WGPUBindGroupLayoutEntry FixedLayoutEntries[3] = {};
+		FixedLayoutEntries[0].binding = 0;
+		FixedLayoutEntries[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+		FixedLayoutEntries[0].buffer.type = WGPUBufferBindingType_Uniform;
+		FixedLayoutEntries[1].binding = 1;
+		FixedLayoutEntries[1].visibility = WGPUShaderStage_Fragment;
+		FixedLayoutEntries[1].texture.sampleType = WGPUTextureSampleType_Float;
+		FixedLayoutEntries[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+		FixedLayoutEntries[2].binding = 2;
+		FixedLayoutEntries[2].visibility = WGPUShaderStage_Fragment;
+		FixedLayoutEntries[2].sampler.type = WGPUSamplerBindingType_Filtering;
+		EntriesByGroup.Add(0).Append(FixedLayoutEntries, 3);
+	}
+
+	// WGPUPipelineLayoutDescriptor::bindGroupLayouts is positional — index i
+	// in that array IS @group(i) as far as Dawn/the shader is concerned — so
+	// every group index from 0 up to the highest real reflected group must
+	// have an entry, even if some intermediate group index was never
+	// reflected by either shader (an empty WGPUBindGroupLayout, 0 entries,
+	// is valid and simply means "nothing bound at this group").
+	uint32 MaxGroup = 0;
+	for (const TPair<uint32, TArray<WGPUBindGroupLayoutEntry>>& Pair : EntriesByGroup)
+	{
+		MaxGroup = FMath::Max(MaxGroup, Pair.Key);
+	}
+
+	TArray<WGPUBindGroupLayout> BindGroupLayouts;
+	BindGroupLayouts.SetNum(MaxGroup + 1);
+	for (uint32 Group = 0; Group <= MaxGroup; ++Group)
+	{
+		const TArray<WGPUBindGroupLayoutEntry>* GroupEntries = EntriesByGroup.Find(Group);
+		WGPUBindGroupLayoutDescriptor BglDesc = {};
+		if (GroupEntries)
+		{
+			BglDesc.entryCount = GroupEntries->Num();
+			BglDesc.entries = GroupEntries->GetData();
+		}
+		BindGroupLayouts[Group] = wgpuDeviceCreateBindGroupLayout(Device, &BglDesc);
+	}
+
+	WGPUPipelineLayoutDescriptor PlDesc = {};
+	PlDesc.bindGroupLayoutCount = BindGroupLayouts.Num();
+	PlDesc.bindGroupLayouts = BindGroupLayouts.GetData();
+	WGPUPipelineLayout PipelineLayout = wgpuDeviceCreatePipelineLayout(Device, &PlDesc);
+
+	WGPUDepthStencilState DepthStencil = {};
+	bool bHasDepth = Initializer.DepthStencilTargetFormat != PF_Unknown;
+	if (bHasDepth)
+	{
+		FDawnDepthStencilState* DSState = static_cast<FDawnDepthStencilState*>(Initializer.DepthStencilState);
+		DepthStencil.format = DawnDepthStencilFormat();
+		DepthStencil.depthWriteEnabled = DSState ? (DSState->Initializer.bEnableDepthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False) : WGPUOptionalBool_True;
+		DepthStencil.depthCompare = DSState ? DawnCompareFunctionFromRHI(DSState->Initializer.DepthTest) : WGPUCompareFunction_LessEqual;
+		DepthStencil.stencilFront.compare = WGPUCompareFunction_Always;
+		DepthStencil.stencilBack.compare = WGPUCompareFunction_Always;
+		DepthStencil.stencilReadMask = 0xFF;
+		DepthStencil.stencilWriteMask = 0xFF;
+	}
+
+	WGPURenderPipelineDescriptor PipeDesc = {};
+	PipeDesc.layout = PipelineLayout;
+	PipeDesc.vertex.module = VS->ShaderModule;
+	auto VsEntry = StringCast<UTF8CHAR>(*VS->EntryPoint);
+	PipeDesc.vertex.entryPoint = { reinterpret_cast<const char*>(VsEntry.Get()), (size_t)VsEntry.Length() };
+	if (Attributes.Num() > 0)
+	{
+		PipeDesc.vertex.bufferCount = 1;
+		PipeDesc.vertex.buffers = &BufferLayout;
+	}
+	PipeDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+	PipeDesc.multisample.count = 1;
+	PipeDesc.multisample.mask = 0xFFFFFFFF;
+	PipeDesc.fragment = &FragState;
+	if (bHasDepth)
+	{
+		PipeDesc.depthStencil = &DepthStencil;
+	}
+
+	WGPURenderPipeline Pipeline = wgpuDeviceCreateRenderPipeline(Device, &PipeDesc);
+	checkf(Pipeline, TEXT("DawnRHI: render pipeline creation failed"));
+
+	FDawnGraphicsPipelineState* PSO = new FDawnGraphicsPipelineState();
+	PSO->Pipeline = Pipeline;
+	PSO->VertexShader = VS;
+	PSO->PixelShader = PS;
+	PSO->BindGroupLayouts = MoveTemp(BindGroupLayouts);
+	PSO->PipelineLayout = PipelineLayout;
+	return PSO;
+}
+
+FRHIBufferInitializer FDawnDynamicRHI::RHICreateBufferInitializer(FRHICommandListBase& RHICmdList, const FRHIBufferCreateDesc& InCreateDesc)
+{
+	// RHIValidation asserts every resource is created with a known initial
+	// ERHIAccess state (matches VulkanRHI's FVulkanDynamicRHI::CreateBuffer,
+	// which calls DetermineInitialState() before constructing the resource).
+	FRHIBufferCreateDesc CreateDesc = InCreateDesc;
+	CreateDesc.DetermineInitialState();
+
+	TRefCountPtr<FDawnBuffer> NewBuffer = new FDawnBuffer(CreateDesc);
+
+	WGPUBufferUsage Usage = WGPUBufferUsage_CopyDst;
+	if (EnumHasAnyFlags(CreateDesc.Usage, EBufferUsageFlags::VertexBuffer)) { Usage |= WGPUBufferUsage_Vertex; }
+	if (EnumHasAnyFlags(CreateDesc.Usage, EBufferUsageFlags::IndexBuffer))  { Usage |= WGPUBufferUsage_Index; }
+	if (EnumHasAnyFlags(CreateDesc.Usage, EBufferUsageFlags::UniformBuffer)) { Usage |= WGPUBufferUsage_Uniform; }
+
+	WGPUBufferDescriptor BufDesc = {};
+	BufDesc.usage = Usage;
+	BufDesc.size = Align(FMath::Max<uint32>(CreateDesc.Size, 4), 4u);
+	BufDesc.mappedAtCreation = true;
+
+	WGPUBuffer Buffer = wgpuDeviceCreateBuffer(Device, &BufDesc);
+	checkf(Buffer, TEXT("DawnRHI: buffer creation failed"));
+	NewBuffer->Buffer = Buffer;
+	NewBuffer->WgpuSize = (uint32)BufDesc.size;
+
+	void* WritableData = wgpuBufferGetMappedRange(Buffer, 0, BufDesc.size);
+
+	// NOTE: FRHIBufferInitializer::FFinalizeCallback is `protected` — only
+	// nameable from a derived type (FDawnBufferInitializerHelper). From this
+	// (non-derived) function we pass a bare lambda as the constructor
+	// argument instead of spelling the protected alias out ourselves; it
+	// converts implicitly at the call site.
+	return FDawnBufferInitializerHelper(RHICmdList, NewBuffer.GetReference(), WritableData, BufDesc.size,
+		[NewBuffer](FRHICommandListBase&) mutable -> FBufferRHIRef
+		{
+			wgpuBufferUnmap(NewBuffer->Buffer);
+			return FBufferRHIRef(NewBuffer);
+		});
+}
+
+void* FDawnDynamicRHI::RHILockBuffer(FRHICommandListBase& RHICmdList, FRHIBuffer* BufferRHI, uint32 Offset, uint32 Size, EResourceLockMode LockMode)
+{
+	// WebGPU buffer mapping is asynchronous (needs an event-loop pump), so CPU
+	// access uses a staging allocation. Writes upload via wgpuQueueWriteBuffer on
+	// unlock; read locks are zero-filled best-effort (init-time resources lock
+	// write-only, which this handles exactly).
+	FDawnBuffer* Buffer = static_cast<FDawnBuffer*>(BufferRHI);
+	const uint64 Alloc = Align((uint64)FMath::Max<uint32>(Size, 4u), 4u);
+	Buffer->LockOffset = Offset;
+	Buffer->LockSize = Size;
+	Buffer->LockStaging = FMemory::Malloc(Alloc);
+	if (LockMode == RLM_ReadOnly)
+	{
+		FMemory::Memzero(Buffer->LockStaging, Alloc);
+	}
+	return Buffer->LockStaging;
+}
+
+void FDawnDynamicRHI::RHIUnlockBuffer(FRHICommandListBase& RHICmdList, FRHIBuffer* BufferRHI)
+{
+	FDawnBuffer* Buffer = static_cast<FDawnBuffer*>(BufferRHI);
+	if (!Buffer->LockStaging)
+	{
+		return;
+	}
+	if (Buffer->Buffer && Buffer->LockSize > 0)
+	{
+		uint64 WriteSize = Align((uint64)Buffer->LockSize, 4u);
+		if (Buffer->LockOffset + WriteSize > Buffer->WgpuSize)
+		{
+			WriteSize = (Buffer->WgpuSize > Buffer->LockOffset) ? (Buffer->WgpuSize - Buffer->LockOffset) : 0;
+			WriteSize &= ~3ull; // keep 4-byte aligned
+		}
+		if (WriteSize > 0)
+		{
+			wgpuQueueWriteBuffer(Queue, Buffer->Buffer, Buffer->LockOffset, Buffer->LockStaging, (size_t)WriteSize);
+		}
+	}
+	FMemory::Free(Buffer->LockStaging);
+	Buffer->LockStaging = nullptr;
+}
+
+FRHITextureInitializer FDawnDynamicRHI::RHICreateTextureInitializer(FRHICommandListBase& RHICmdList, const FRHITextureCreateDesc& InCreateDesc)
+{
+	// Same DetermineInitialState() requirement as RHICreateBufferInitializer above.
+	FRHITextureCreateDesc CreateDesc = InCreateDesc;
+	if (CreateDesc.InitialState == ERHIAccess::Unknown)
+	{
+		CreateDesc.SetInitialState(RHIGetDefaultResourceState(CreateDesc.Flags, false));
+	}
+
+	UE_LOG(LogDawnRHI, Warning, TEXT("TEXDIAG entry: thread=%u gt=%d rt=%d"), FPlatformTLS::GetCurrentThreadId(), (int32)IsInGameThread(), (int32)IsInRenderingThread()); UE_LOG(LogDawnRHI, Warning, TEXT("TEXDIAG e2: fmt=%d %dx%d flags=0x%llx"), (int32)CreateDesc.Format, CreateDesc.Extent.X, CreateDesc.Extent.Y, (uint64)CreateDesc.Flags);
+	TRefCountPtr<FDawnTexture> NewTexture = new FDawnTexture(CreateDesc);
+
+	const bool bIsDepthStencil = EnumHasAnyFlags(CreateDesc.Flags, ETextureCreateFlags::DepthStencilTargetable);
+
+	WGPUTextureUsage Usage = WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+	if (bIsDepthStencil)
+	{
+		Usage |= WGPUTextureUsage_RenderAttachment;
+	}
+	if (EnumHasAnyFlags(CreateDesc.Flags, ETextureCreateFlags::RenderTargetable))
+	{
+		Usage |= WGPUTextureUsage_RenderAttachment;
+	}
+	if (EnumHasAnyFlags(CreateDesc.Flags, ETextureCreateFlags::ShaderResource) || !bIsDepthStencil)
+	{
+		// Default non-depth textures to sampleable: most UE textures (incl. Slate's
+		// font atlas, whose create desc omits an explicit ShaderResource flag) are
+		// sampled, and WebGPU requires the usage bit up-front at creation.
+		Usage |= WGPUTextureUsage_TextureBinding;
+	}
+
+	WGPUTextureDescriptor TexDesc = {};
+	TexDesc.usage = Usage;
+	TexDesc.dimension = WGPUTextureDimension_2D;
+	TexDesc.size = { (uint32)CreateDesc.Extent.X, (uint32)CreateDesc.Extent.Y, 1 };
+	TexDesc.format = bIsDepthStencil ? DawnDepthStencilFormat() : DawnTextureFormatFromPixelFormat(CreateDesc.Format);
+	// Clamp mip count to what WebGPU allows for these dimensions
+	// (floor(log2(max(w,h)))+1). A NumMips larger than the extent supports makes
+	// the full-mip TextureView invalid -> "mip level count (N) is invalid" ->
+	// invalid command buffer -> crash.
+	{
+		const uint32 _MaxDim = FMath::Max<uint32>(TexDesc.size.width, TexDesc.size.height);
+		const uint32 _MaxMips = _MaxDim > 0 ? ((uint32)FMath::FloorLog2(_MaxDim) + 1u) : 1u;
+		TexDesc.mipLevelCount = FMath::Clamp<uint32>((uint32)CreateDesc.NumMips, 1u, _MaxMips);
+	}
+	TexDesc.sampleCount = 1;
+
+	UE_LOG(LogDawnRHI, Warning, TEXT("TEXDIAG desc: usage=0x%x wgpuFmt=%d dim=%d size=%ux%u mip=%u samp=%u ds=%d"), (uint32)TexDesc.usage, (int32)TexDesc.format, (int32)TexDesc.dimension, TexDesc.size.width, TexDesc.size.height, TexDesc.mipLevelCount, TexDesc.sampleCount, (int32)bIsDepthStencil);
+	WGPUTexture Texture = wgpuDeviceCreateTexture(Device, &TexDesc);
+	UE_LOG(LogDawnRHI, Warning, TEXT("TEXDIAG created: wgpuTex=%p wgpuFmt=%d"), (void*)Texture, (int32)TexDesc.format);
+	checkf(Texture, TEXT("DawnRHI: texture creation failed"));
+	NewTexture->Texture = Texture;
+	NewTexture->View = wgpuTextureCreateView(Texture, nullptr);
+	// Render-pass attachments require a single-mip view (WebGPU forbids binding a
+	// multi-mip view as a color/depth attachment). Keep the full-mip View for
+	// sampling; build a dedicated single-mip RTView for RT/depth binding.
+	if (EnumHasAnyFlags(CreateDesc.Flags, ETextureCreateFlags::RenderTargetable | ETextureCreateFlags::DepthStencilTargetable))
+	{
+		WGPUTextureViewDescriptor _RtvDesc = {};
+		_RtvDesc.format = TexDesc.format;
+		_RtvDesc.dimension = WGPUTextureViewDimension_2D;
+		_RtvDesc.baseMipLevel = 0;
+		_RtvDesc.mipLevelCount = 1;
+		_RtvDesc.baseArrayLayer = 0;
+		_RtvDesc.arrayLayerCount = 1;
+		_RtvDesc.aspect = WGPUTextureAspect_All;
+		NewTexture->RTView = wgpuTextureCreateView(Texture, &_RtvDesc);
+	}
+
+	// Initial pixel data (Stage 2: sampled textures, e.g. a material/UI
+	// texture). GetSubresourceCallback hands the caller a CPU-side staging
+	// buffer to WriteData() into; FinalizeCallback uploads it via
+	// wgpuQueueWriteTexture and frees the staging memory. WebGPU has no
+	// buffer-style mappedAtCreation for textures, so this (rather than the
+	// buffer path's direct-mapped-pointer trick) is the correct shape here.
+	const uint32 Width = (uint32)CreateDesc.Extent.X;
+	const uint32 Height = (uint32)CreateDesc.Extent.Y;
+	// Block-aware staging size (handles wide formats like RGBA16F/RGBA32F and
+	// BC/DXT compressed, not just 4-byte RGBA8). A hardcoded 4 bpp overflowed the
+	// staging buffer for wider formats -> heap corruption on free.
+	const FPixelFormatInfo& InitFmt = GPixelFormats[CreateDesc.Format];
+	const uint32 NumBlocksX = FMath::DivideAndRoundUp(Width, (uint32)FMath::Max<int32>(1, InitFmt.BlockSizeX));
+	const uint32 NumBlocksY = FMath::DivideAndRoundUp(Height, (uint32)FMath::Max<int32>(1, InitFmt.BlockSizeY));
+	const uint32 RowPitch = NumBlocksX * (uint32)InitFmt.BlockBytes;
+	const uint64 StagingSize = (uint64)RowPitch * NumBlocksY;
+	const bool bInitCompressed = InitFmt.BlockSizeX > 1; // Apple WebGPU has no BC support
+	TSharedPtr<TArray<uint8>> Staging = MakeShared<TArray<uint8>>();
+
+	// NOTE: same protected-typedef situation as FFinalizeCallback above —
+	// FGetSubresourceCallback can't be named from this (non-derived)
+	// function, so both lambdas below are passed as bare arguments rather
+	// than assigned to a named variable of that type first.
+	WGPUQueue QueueCopy = Queue;
+	return FDawnTextureInitializerHelper(RHICmdList, NewTexture.GetReference(),
+		[NewTexture, Staging, Width, Height, RowPitch, NumBlocksY, bInitCompressed, QueueCopy](FRHICommandListBase&) mutable -> FTextureRHIRef
+		{
+			if (Staging->Num() > 0 && !bInitCompressed)
+			{
+				WGPUTexelCopyTextureInfo Dst = {};
+				Dst.texture = NewTexture->Texture;
+				WGPUTexelCopyBufferLayout Layout = {};
+				Layout.bytesPerRow = RowPitch;
+				Layout.rowsPerImage = NumBlocksY;
+				WGPUExtent3D Size = { Width, Height, 1 };
+				wgpuQueueWriteTexture(QueueCopy, &Dst, Staging->GetData(), Staging->Num(), &Layout, &Size);
+			}
+			return FTextureRHIRef(NewTexture);
+		},
+		[Staging, StagingSize, RowPitch](FRHITextureInitializer::FSubresourceIndex) -> FRHITextureSubresourceInitializer
+		{
+			Staging->SetNumUninitialized((int64)StagingSize);
+			FRHITextureSubresourceInitializer SubresourceInit;
+			SubresourceInit.Data = Staging->GetData();
+			SubresourceInit.Size = StagingSize;
+			SubresourceInit.Stride = RowPitch;
+			return SubresourceInit;
+		});
+}
+
+uint32 FDawnDynamicRHI::RHIComputeMemorySize(FRHITexture* TextureRHI)
+{
+	if (!TextureRHI) { return 0; }
+	const FRHITextureDesc& Desc = TextureRHI->GetDesc();
+	return Desc.Extent.X * Desc.Extent.Y * 4;
+}
+
+void FDawnDynamicRHI::RHIReadSurfaceData(FRHITexture* Texture, FIntRect Rect, TArray<FColor>& OutData, FReadSurfaceDataFlags InFlags)
+{
+	FDawnTexture* Tex = static_cast<FDawnTexture*>(Texture);
+	checkf(Tex && Tex->Texture, TEXT("DawnRHI: RHIReadSurfaceData needs a valid Dawn texture"));
+
+	const uint32 Width = Rect.Width();
+	const uint32 Height = Rect.Height();
+	const uint32 BytesPerRow = Align(Width * 4, 256);
+
+	WGPUBufferDescriptor BufDesc = {};
+	BufDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+	BufDesc.size = BytesPerRow * Height;
+	WGPUBuffer ReadbackBuf = wgpuDeviceCreateBuffer(Device, &BufDesc);
+
+	WGPUCommandEncoderDescriptor EncDesc = {};
+	WGPUCommandEncoder Encoder = wgpuDeviceCreateCommandEncoder(Device, &EncDesc);
+
+	WGPUTexelCopyTextureInfo SrcTex = {};
+	SrcTex.texture = Tex->Texture;
+	SrcTex.origin = { (uint32)Rect.Min.X, (uint32)Rect.Min.Y, 0 };
+	WGPUTexelCopyBufferInfo DstBuf = {};
+	DstBuf.buffer = ReadbackBuf;
+	DstBuf.layout.bytesPerRow = BytesPerRow;
+	DstBuf.layout.rowsPerImage = Height;
+	WGPUExtent3D CopySize = { Width, Height, 1 };
+	wgpuCommandEncoderCopyTextureToBuffer(Encoder, &SrcTex, &DstBuf, &CopySize);
+
+	WGPUCommandBufferDescriptor CbDesc = {};
+	WGPUCommandBuffer CmdBuf = wgpuCommandEncoderFinish(Encoder, &CbDesc);
+	wgpuQueueSubmit(Queue, 1, &CmdBuf);
+	wgpuCommandEncoderRelease(Encoder);
+	wgpuCommandBufferRelease(CmdBuf);
+
+	bool bMapped = false;
+	WGPUBufferMapCallbackInfo MapCbInfo = {};
+	MapCbInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+	MapCbInfo.callback = [](WGPUMapAsyncStatus, WGPUStringView, void* Userdata1, void*)
+	{
+		*reinterpret_cast<bool*>(Userdata1) = true;
+	};
+	MapCbInfo.userdata1 = &bMapped;
+	WGPUFuture MapFuture = wgpuBufferMapAsync(ReadbackBuf, WGPUMapMode_Read, 0, BufDesc.size, MapCbInfo);
+	(void)MapFuture;
+	for (int32 i = 0; i < 200000 && !bMapped; ++i)
+	{
+#if DAWNRHI_WASM
+		emscripten_sleep(1);
+#else
+		WGPUFutureWaitInfo WaitInfo = {};
+		WaitInfo.future = MapFuture;
+		wgpuInstanceWaitAny(Instance, 1, &WaitInfo, 1000000);
+#endif
+	}
+	checkf(bMapped, TEXT("DawnRHI: readback buffer never mapped"));
+
+	const uint8* Mapped = reinterpret_cast<const uint8*>(wgpuBufferGetConstMappedRange(ReadbackBuf, 0, BufDesc.size));
+	OutData.SetNumUninitialized(Width * Height);
+	for (uint32 Y = 0; Y < Height; ++Y)
+	{
+		const uint8* Row = Mapped + Y * BytesPerRow;
+		for (uint32 X = 0; X < Width; ++X)
+		{
+			OutData[Y * Width + X] = FColor(Row[X * 4 + 0], Row[X * 4 + 1], Row[X * 4 + 2], Row[X * 4 + 3]);
+		}
+	}
+	wgpuBufferUnmap(ReadbackBuf);
+	wgpuBufferRelease(ReadbackBuf);
+}
+
+void FDawnDynamicRHI::RHIBlockUntilGPUIdle()
+{
+	WaitForQueueIdle(Instance, Queue);
+}
+
+void* FDawnDynamicRHI::RHIGetNativeDevice()
+{
+	return Device;
+}
+
+IRHICommandContext* FDawnDynamicRHI::RHIGetDefaultContext()
+{
+	return CommandContext.Get();
+}
+
+IRHIComputeContext* FDawnDynamicRHI::RHIGetCommandContext(ERHIPipeline Pipeline)
+{
+	// Stage 1: graphics-only. Async compute is a later-stage concern.
+	return (Pipeline == ERHIPipeline::Graphics) ? CommandContext.Get() : nullptr;
+}
+
+// NOTE: the return type must be qualified here (FDynamicRHI::...) even
+// though FDawnDynamicRHI inherits it — for an out-of-line member function
+// definition, the leading return type is looked up in the enclosing scope
+// *before* `FDawnDynamicRHI::` establishes class-member lookup.
+FDynamicRHI::FRHIFinalizeContextsResult FDawnDynamicRHI::RHIFinalizeContexts(FDynamicRHI::FRHIFinalizeContextsArgs&& Args)
+{
+	// Stage 1 runs in immediate mode (see FDawnCommandContext) — every RHI*
+	// call already executed against the Dawn command encoder by the time
+	// this is reached, so there is nothing to translate/finalize here.
+	return {};
+}
+
+void FDawnDynamicRHI::RHISubmitCommandLists(FRHISubmitCommandListsArgs&& Args)
+{
+	if (CommandContext)
+	{
+		CommandContext->SubmitToQueue();
+	}
+}
+
+// ============================================================================
+// Stub bodies (checkNoEntry) for FDynamicRHI methods a bare triangle never
+// hits — compute, ray tracing, bindless views, viewport/present, texture
+// upload/lock, uniform buffers, async texture streaming, queries, resolution
+// enumeration. See module README / task report for the full real-vs-stub list.
+// ============================================================================
+
+void FDawnDynamicRHI::RHIEndFrame(const FRHIEndFrameArgs& Args)
+{
+	// Per-frame surface backbuffer rotation. emdawnwebgpu auto-presents whatever was
+	// submitted to the current surface texture when the worker yields, so we must
+	// release+re-acquire the surface texture EACH frame. The viewport's own
+	// RHIEndDrawingViewport fires only occasionally on this SimplyStream setup;
+	// RHIEndFrame is called once per frame, so drive the rotation from here. Deferred
+	// by one frame (via PendingRelease, released at the next RHIGetViewportBackBuffer)
+	// so the browser has presented the texture before we destroy it.
+	if (ActiveViewportRHI)
+	{
+		FDawnViewport* Viewport = static_cast<FDawnViewport*>(ActiveViewportRHI);
+		// Backbuffer is persistent; surface texture swapped in RHIGetViewportBackBuffer.
+		// The browser AUTO-presents the surface when the worker yields (JSPI); calling
+		// wgpuSurfacePresent here blocks the worker and stalls the render loop.
+		(void)Viewport;
+	}
+}
+
+FGeometryShaderRHIRef FDawnDynamicRHI::RHICreateGeometryShader(const FRHICreateShaderDesc& CreateShaderDesc)
+{
+	checkNoEntry();
+	return {};
+}
+
+FComputeShaderRHIRef FDawnDynamicRHI::RHICreateComputeShader(const FRHICreateShaderDesc& CreateShaderDesc)
+{
+	// DawnRHI runs no compute; hand back an empty compute shader object so callers don't crash.
+	// (Compute passes are no-ops in the command context.)
+	return new FDawnComputeShader();
+}
+
+class FDawnGPUFence final : public FRHIGPUFence
+{
+public:
+	explicit FDawnGPUFence(FName InName) : FRHIGPUFence(InName) {}
+	virtual void Clear() override {}
+	virtual bool Poll() const override { return true; }
+	virtual bool Poll(FRHIGPUMask GPUMask) const override { return true; }
+	virtual void Wait(FRHICommandListImmediate& RHICmdList, FRHIGPUMask GPUMask) const override {}
+};
+
+FGPUFenceRHIRef FDawnDynamicRHI::RHICreateGPUFence(const FName &Name)
+{
+	return new FDawnGPUFence(Name);
+}
+
+FBoundShaderStateRHIRef FDawnDynamicRHI::RHICreateBoundShaderState(FRHIVertexDeclaration* VertexDeclaration, FRHIVertexShader* VertexShader, FRHIPixelShader* PixelShader, FRHIGeometryShader* GeometryShader)
+{
+	checkNoEntry();
+	return {};
+}
+
+FComputePipelineStateRHIRef FDawnDynamicRHI::RHICreateComputePipelineState(const FComputePipelineStateInitializer& Initializer)
+{
+	// DawnRHI runs no compute; dummy PSO (dispatch is a no-op).
+	return new FDawnComputePipelineState(Initializer.ComputeShader);
+}
+
+FUniformBufferRHIRef FDawnDynamicRHI::RHICreateUniformBuffer(const void* Contents, const FRHIUniformBufferLayout* Layout, EUniformBufferUsage Usage, EUniformBufferValidation Validation)
+{
+	FDawnUniformBuffer* UB = new FDawnUniformBuffer(Layout);
+
+	// WebGPU buffers must be a multiple of 4 bytes for wgpuQueueWriteBuffer;
+	// UE's constant buffers are already 16-byte aligned in practice, but
+	// round up defensively.
+	const uint32 Size = Align(FMath::Max<uint32>(Layout->ConstantBufferSize, 4), 4);
+
+	WGPUBufferDescriptor BufDesc = {};
+	BufDesc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+	BufDesc.size = Size;
+	UB->Buffer = wgpuDeviceCreateBuffer(Device, &BufDesc);
+	checkf(UB->Buffer, TEXT("DawnRHI: uniform buffer creation failed"));
+
+	if (Contents && Layout->ConstantBufferSize > 0)
+	{
+		wgpuQueueWriteBuffer(Queue, UB->Buffer, 0, Contents, Layout->ConstantBufferSize);
+		{
+			const FString UBName = Layout->GetDebugName();
+			static uint32 _ubn=0; if (_ubn++ < 40) { UE_LOG(LogTemp, Warning, TEXT("UBNAME %s size=%u"), *UBName, Layout->ConstantBufferSize); }
+			// Dump the View UB matrix rows to check the view/projection transform is sane.
+			if (UBName.Contains(TEXT("View")) && !UBName.Contains(TEXT("Slate")) && Layout->ConstantBufferSize >= 64)
+			{
+				static uint32 _vw=0; if (_vw++ < 4) { const float* F=(const float*)Contents;
+					UE_LOG(LogTemp, Warning, TEXT("VIEWUB %s sz=%u m[0..15]=[%.3f %.3f %.3f %.3f][%.3f %.3f %.3f %.3f][%.3f %.3f %.3f %.3f][%.3f %.3f %.3f %.3f]"), *UBName, Layout->ConstantBufferSize, F[0],F[1],F[2],F[3],F[4],F[5],F[6],F[7],F[8],F[9],F[10],F[11],F[12],F[13],F[14],F[15]); }
+			}
+		}
+	}
+	return UB;
+}
+
+void FDawnDynamicRHI::RHIUpdateUniformBuffer(FRHICommandListBase& RHICmdList, FRHIUniformBuffer* UniformBufferRHI, const void* Contents)
+{
+	// Slate (and the renderer) push fresh per-frame constants through here; a
+	// no-op leaves shaders reading stale/zero uniforms -> nothing visible.
+	FDawnUniformBuffer* UB = static_cast<FDawnUniformBuffer*>(UniformBufferRHI);
+	if (UB && UB->Buffer && Contents)
+	{
+		const uint32 Size = UB->GetLayout().ConstantBufferSize;
+		if (Size > 0)
+		{
+			wgpuQueueWriteBuffer(Queue, UB->Buffer, 0, Contents, Size);
+		}
+	}
+}
+
+void FDawnDynamicRHI::RHIReplaceResources(FRHICommandListBase& RHICmdList, TArray<FRHIResourceReplaceInfo>&& ReplaceInfos)
+{
+	checkNoEntry();
+}
+
+FRHICalcTextureSizeResult FDawnDynamicRHI::RHICalcTexturePlatformSize(FRHITextureDesc const& Desc, uint32 FirstMipIndex)
+{
+	FRHICalcTextureSizeResult Result;
+	Result.Size = Desc.CalcMemorySizeEstimate(FirstMipIndex);
+	Result.Align = 4;
+	return Result;
+}
+
+void FDawnDynamicRHI::RHIGetTextureMemoryStats(FTextureMemoryStats& OutStats)
+{
+	checkNoEntry();
+}
+
+bool FDawnDynamicRHI::RHIGetTextureMemoryVisualizeData(FColor* TextureData, int32 SizeX, int32 SizeY, int32 Pitch, int32 PixelSize)
+{
+	checkNoEntry();
+	return false;
+}
+
+FTextureRHIRef FDawnDynamicRHI::RHIAsyncCreateTexture2D(uint32 SizeX, uint32 SizeY, uint8 Format, uint32 NumMips, ETextureCreateFlags Flags, ERHIAccess InResourceState, void** InitialMipData, uint32 NumInitialMips, const TCHAR* DebugName, FGraphEventRef& OutCompletionEvent)
+{
+	checkNoEntry();
+	return {};
+}
+
+FShaderResourceViewRHIRef FDawnDynamicRHI::RHICreateShaderResourceView(class FRHICommandListBase& RHICmdList, FRHIViewableResource* Resource, FRHIViewDesc const& ViewDesc)
+{
+	FDawnShaderResourceView* SRV = new FDawnShaderResourceView(Resource, ViewDesc);
+	if (ViewDesc.Common.ViewType == FRHIViewDesc::EViewType::TextureSRV)
+	{
+		FDawnTexture* Tex = static_cast<FDawnTexture*>(static_cast<FRHITexture*>(Resource));
+		SRV->TextureView = Tex ? Tex->View : nullptr;
+	}
+	else
+	{
+		FDawnBuffer* Buf = static_cast<FDawnBuffer*>(static_cast<FRHIBuffer*>(Resource));
+		if (Buf) { SRV->Buffer = Buf->Buffer; SRV->BufferSize = Buf->WgpuSize; }
+	}
+	return SRV;
+}
+
+FUnorderedAccessViewRHIRef FDawnDynamicRHI::RHICreateUnorderedAccessView(class FRHICommandListBase& RHICmdList, FRHIViewableResource* Resource, FRHIViewDesc const& ViewDesc)
+{
+	FDawnUnorderedAccessView* UAV = new FDawnUnorderedAccessView(Resource, ViewDesc);
+	if (ViewDesc.Common.ViewType == FRHIViewDesc::EViewType::TextureUAV)
+	{
+		FDawnTexture* Tex = static_cast<FDawnTexture*>(static_cast<FRHITexture*>(Resource));
+		UAV->TextureView = Tex ? Tex->View : nullptr;
+	}
+	else
+	{
+		FDawnBuffer* Buf = static_cast<FDawnBuffer*>(static_cast<FRHIBuffer*>(Resource));
+		if (Buf) { UAV->Buffer = Buf->Buffer; UAV->BufferSize = Buf->WgpuSize; }
+	}
+	return UAV;
+}
+
+FRHILockTextureResult FDawnDynamicRHI::RHILockTexture(FRHICommandListImmediate& RHICmdList, const FRHILockTextureArgs& Arguments)
+{
+	// Write path: hand back a CPU staging allocation for the requested mip; the
+	// matching RHIUnlockTexture uploads it via wgpuQueueWriteTexture. (Read locks
+	// would need async mapping; write is what texture streaming/UI updates use.)
+	FDawnTexture* Tex = static_cast<FDawnTexture*>(Arguments.Texture);
+	const FRHITextureDesc& Desc = Tex->GetDesc();
+	const FPixelFormatInfo& FmtInfo = GPixelFormats[Desc.Format];
+	const uint32 MipW = FMath::Max<uint32>(1u, (uint32)Desc.Extent.X >> Arguments.MipIndex);
+	const uint32 MipH = FMath::Max<uint32>(1u, (uint32)Desc.Extent.Y >> Arguments.MipIndex);
+	// Block-aware size (handles BC/DXT compressed formats, not just 4-byte RGBA/BGRA).
+	const uint32 NumBlocksX = FMath::DivideAndRoundUp(MipW, (uint32)FmtInfo.BlockSizeX);
+	const uint32 NumBlocksY = FMath::DivideAndRoundUp(MipH, (uint32)FmtInfo.BlockSizeY);
+	const uint32 Stride = NumBlocksX * (uint32)FmtInfo.BlockBytes;
+	const uint64 Size = (uint64)Stride * NumBlocksY;
+	Tex->LockStaging = FMemory::Malloc(FMath::Max<uint64>(Size, 4));
+	Tex->LockMip = Arguments.MipIndex;
+	Tex->LockW = MipW; Tex->LockH = MipH; Tex->LockStride = Stride; Tex->LockSize = Size;
+	Tex->LockRows = NumBlocksY; Tex->LockBlockX = (uint32)FmtInfo.BlockSizeX;
+	FRHILockTextureResult Result;
+	Result.Data = Tex->LockStaging;
+	Result.Stride = Stride;
+	Result.ByteCount = Size;
+	return Result;
+}
+
+void FDawnDynamicRHI::RHIUnlockTexture(FRHICommandListImmediate& RHICmdList, const FRHILockTextureArgs& Arguments)
+{
+	FDawnTexture* Tex = static_cast<FDawnTexture*>(Arguments.Texture);
+	if (!Tex->LockStaging)
+	{
+		return;
+	}
+	if (Tex->Texture && Tex->LockSize > 0)
+	{
+		WGPUTexelCopyTextureInfo Dst = {};
+		Dst.texture = Tex->Texture;
+		Dst.mipLevel = Tex->LockMip;
+		WGPUTexelCopyBufferLayout Layout = {};
+		Layout.bytesPerRow = Tex->LockStride;
+		Layout.rowsPerImage = Tex->LockRows;
+		WGPUExtent3D WriteExtent = { Tex->LockW, Tex->LockH, 1 };
+		// Skip block-compressed uploads: Apple WebGPU has no BC support, so such
+		// textures were created as RGBA8 and their BC data cannot be written.
+		if (Tex->LockBlockX <= 1)
+		{
+			if (Tex->LockStride >= Tex->LockW && Tex->LockW > 0 && Tex->LockH > 0 && (Tex->LockStride / Tex->LockW) == 1) { static uint32 _uc=0; if (_uc++ < 12) { const uint8* B=(const uint8*)Tex->LockStaging; uint32 mn=255,mx=0,nz=0; uint64 sum=0,cnt=0; for (uint32 ry=0; ry<Tex->LockH; ++ry){ const uint8* R=B+(uint64)ry*Tex->LockStride; for (uint32 rx=0; rx<Tex->LockW; ++rx){ uint8 v=R[rx]; mn=FMath::Min<uint32>(mn,v); mx=FMath::Max<uint32>(mx,v); if(v>0)++nz; sum+=v; ++cnt; } } UE_LOG(LogDawnRHI, Warning, TEXT("FONTUNLOCK fmt=%d WxH=%ux%u stride=%u min=%u max=%u avg=%llu nz=%u/%llu"), (int)Tex->GetDesc().Format, Tex->LockW, Tex->LockH, Tex->LockStride, mn, mx, cnt?sum/cnt:0, nz, (unsigned long long)cnt); } }
+			if (Tex->GetDesc().Format == PF_A8)
+			{
+				// A8 has no WebGPU equivalent -> the texture is RGBA8Unorm. Expand the
+				// 1-byte coverage into RGBA (all channels = coverage) so the Slate
+				// grayscale-font shader (samples .w) reads the glyph coverage, not 1.0.
+				const uint32 W = Tex->LockW, H = Tex->LockH;
+				TArray<uint8> Rgba; Rgba.SetNumUninitialized((int32)(W * H * 4));
+				const uint8* Sp = (const uint8*)Tex->LockStaging;
+				for (uint32 y = 0; y < H; ++y)
+				{
+					const uint8* SR = Sp + (uint64)y * Tex->LockStride;
+					uint8* DR = Rgba.GetData() + (uint64)y * W * 4;
+					for (uint32 x = 0; x < W; ++x) { const uint8 Cov = SR[x]; DR[x*4+0]=Cov; DR[x*4+1]=Cov; DR[x*4+2]=Cov; DR[x*4+3]=Cov; }
+				}
+				WGPUTexelCopyBufferLayout L2 = {}; L2.bytesPerRow = W * 4; L2.rowsPerImage = H;
+				wgpuQueueWriteTexture(Queue, &Dst, Rgba.GetData(), (size_t)Rgba.Num(), &L2, &WriteExtent);
+			}
+			else
+			{
+				wgpuQueueWriteTexture(Queue, &Dst, Tex->LockStaging, (size_t)Tex->LockSize, &Layout, &WriteExtent);
+			}
+		}
+	}
+	FMemory::Free(Tex->LockStaging);
+	Tex->LockStaging = nullptr;
+}
+
+void FDawnDynamicRHI::RHIUpdateTexture2D(FRHICommandListBase& RHICmdList, FRHITexture* Texture, uint32 MipIndex, const struct FUpdateTextureRegion2D& UpdateRegion, uint32 SourcePitch, const uint8* SourceData)
+{
+	// Slate updates its font atlas and dynamic UI textures through this path every
+	// frame; without it the whole front-end stays blank. Upload the dirty region
+	// via wgpuQueueWriteTexture.
+	FDawnTexture* Tex = static_cast<FDawnTexture*>(Texture);
+	if (!Tex || !Tex->Texture || !SourceData || SourcePitch == 0 || UpdateRegion.Width == 0 || UpdateRegion.Height == 0)
+	{
+		return;
+	}
+	const FRHITextureDesc& Desc = Tex->GetDesc();
+	const FPixelFormatInfo& Fmt = GPixelFormats[Desc.Format];
+	if (Fmt.BlockSizeX > 1)
+	{
+		return; // block-compressed (created as RGBA8 substitute); no CPU BC upload
+	}
+	const uint32 BlockBytes = (uint32)Fmt.BlockBytes;
+	const uint8* Src = SourceData + (uint64)UpdateRegion.SrcY * SourcePitch + (uint64)UpdateRegion.SrcX * BlockBytes;
+	WGPUTexelCopyTextureInfo Dst = {};
+	Dst.texture = Tex->Texture;
+	Dst.mipLevel = MipIndex;
+	Dst.origin = { UpdateRegion.DestX, UpdateRegion.DestY, 0 };
+	WGPUTexelCopyBufferLayout Layout = {};
+	Layout.bytesPerRow = SourcePitch;
+	Layout.rowsPerImage = UpdateRegion.Height;
+	WGPUExtent3D Size = { UpdateRegion.Width, UpdateRegion.Height, 1 };
+	// Tight span WebGPU actually reads: rows are strided by SourcePitch but the LAST
+	// row only needs Width*BlockBytes. Using SourcePitch*Height overreads past the
+	// source buffer when the region sits at the atlas right/bottom edge (Slate font
+	// atlas) -> wasm memory-access-out-of-bounds in wgpuQueueWriteTexture memcpy.
+	const size_t DataSize = (size_t)SourcePitch * (size_t)(UpdateRegion.Height - 1) + (size_t)UpdateRegion.Width * (size_t)BlockBytes;
+	if (BlockBytes == 1) { static uint32 _fc=0; if (_fc++ < 12) { uint32 mn=255,mx=0,nz=0; uint64 sum=0,cnt=0; for (uint32 ry=0; ry<UpdateRegion.Height; ++ry) { const uint8* R=Src+(uint64)ry*SourcePitch; for (uint32 rx=0; rx<UpdateRegion.Width; ++rx){ uint8 v=R[rx]; mn=FMath::Min<uint32>(mn,v); mx=FMath::Max<uint32>(mx,v); if(v>0)++nz; sum+=v; ++cnt; } } UE_LOG(LogDawnRHI, Warning, TEXT("FONTDIAG fmt=%d WxH=%ux%u min=%u max=%u avg=%llu nonzero=%u/%llu"), (int)Desc.Format, UpdateRegion.Width, UpdateRegion.Height, mn, mx, cnt?sum/cnt:0, nz, (unsigned long long)cnt); } }
+	wgpuQueueWriteTexture(Queue, &Dst, Src, DataSize, &Layout, &Size);
+}
+
+void FDawnDynamicRHI::RHIUpdateTexture3D(FRHICommandListBase& RHICmdList, FRHITexture* Texture, uint32 MipIndex, const struct FUpdateTextureRegion3D& UpdateRegion, uint32 SourceRowPitch, uint32 SourceDepthPitch, const uint8* SourceData)
+{
+	checkNoEntry();
+}
+
+void FDawnDynamicRHI::RHIMapStagingSurface(FRHITexture* Texture, FRHIGPUFence* Fence, void*& OutData, int32& OutWidth, int32& OutHeight, uint32 GPUIndex)
+{
+	checkNoEntry();
+}
+
+void FDawnDynamicRHI::RHIUnmapStagingSurface(FRHITexture* Texture, uint32 GPUIndex)
+{
+	checkNoEntry();
+}
+
+void FDawnDynamicRHI::RHIReadSurfaceFloatData(FRHITexture* Texture, FIntRect Rect, TArray<FFloat16Color>& OutData, ECubeFace CubeFace, int32 ArrayIndex, int32 MipIndex)
+{
+	checkNoEntry();
+}
+
+void FDawnDynamicRHI::RHIRead3DSurfaceFloatData(FRHITexture* Texture, FIntRect Rect, FIntPoint ZMinMax, TArray<FFloat16Color>& OutData)
+{
+	checkNoEntry();
+}
+
+FRenderQueryRHIRef FDawnDynamicRHI::RHICreateRenderQuery(ERenderQueryType QueryType)
+{
+	checkNoEntry();
+	return {};
+}
+
+bool FDawnDynamicRHI::RHIGetRenderQueryResult(FRHIRenderQuery* RenderQuery, uint64& OutResult, bool bWait, uint32 GPUIndex)
+{
+	checkNoEntry();
+	return false;
+}
+
+FTextureRHIRef FDawnDynamicRHI::RHIGetViewportBackBuffer(FRHIViewport* ViewportRHI)
+{
+	FDawnViewport* Viewport = static_cast<FDawnViewport*>(ViewportRHI);
+	// Release the surface texture from TWO frames ago now (presented last frame -> GPU done).
+	if (Viewport->PrevSurfView) { wgpuTextureViewRelease(Viewport->PrevSurfView); Viewport->PrevSurfView = nullptr; }
+	if (Viewport->PrevSurfTex)  { wgpuTextureRelease(Viewport->PrevSurfTex);       Viewport->PrevSurfTex  = nullptr; }
+	if (Viewport->Surface)
+	{
+		WGPUSurfaceTexture SurfTex = {};
+		wgpuSurfaceGetCurrentTexture(Viewport->Surface, &SurfTex);
+		{ static uint32 _sf=0; if((_sf++%120)==0) UE_LOG(LogTemp, Warning, TEXT("SURFDIAG status=%d tex=%p surface=%p"), (int)SurfTex.status, (void*)SurfTex.texture, (void*)Viewport->Surface); }
+		if (SurfTex.texture)
+		{
+			// PERSISTENT backbuffer: the engine caches the backbuffer ref and renders to it
+			// every frame, so keep the SAME FDawnTexture object and just swap in this frame's
+			// surface texture. Creating a fresh object each frame left the engine rendering to
+			// a stale texture while the surface presented an empty one -> black screen.
+			if (!Viewport->BackBuffer.IsValid())
+			{
+				FRHITextureCreateDesc Desc = FRHITextureCreateDesc::Create2D(TEXT("DawnBackBuffer"), Viewport->Width, Viewport->Height, PF_B8G8R8A8)
+					.SetFlags(ETextureCreateFlags::RenderTargetable | ETextureCreateFlags::Presentable);
+				Desc.SetInitialState(ERHIAccess::RTV);
+				Viewport->BackBuffer = new FDawnTexture(Desc);
+			}
+			FDawnTexture* BB = static_cast<FDawnTexture*>(Viewport->BackBuffer.GetReference());
+			// Defer release of the prior surface texture/view by one frame (avoids submit races).
+			Viewport->PrevSurfView = BB->View;
+			Viewport->PrevSurfTex  = BB->Texture;
+			BB->Texture = SurfTex.texture;
+			BB->bOwnsTexture = false; // lifetime managed manually via the PrevSurf* deferral
+			BB->View = wgpuTextureCreateView(SurfTex.texture, nullptr);
+		}
+	}
+	return Viewport->BackBuffer.GetReference();
+}
+
+FViewportRHIRef FDawnDynamicRHI::RHICreateViewport(void* WindowHandle, uint32 SizeX, uint32 SizeY, bool bIsFullscreen, EPixelFormat PixelFormat)
+{
+	FDawnViewport* Viewport = new FDawnViewport();
+	Viewport->Width = FMath::Max<uint32>(SizeX, 1);
+	Viewport->Height = FMath::Max<uint32>(SizeY, 1);
+	Viewport->Format = WGPUTextureFormat_BGRA8Unorm;
+	// Create a WebGPU surface from the page canvas and configure the swapchain.
+	WGPUEmscriptenSurfaceSourceCanvasHTMLSelector CanvasSrc = {};
+	CanvasSrc.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
+	static const char* kCanvasSel = "#canvas";
+	CanvasSrc.selector = { kCanvasSel, 7 };
+	WGPUSurfaceDescriptor SurfDesc = {};
+	SurfDesc.nextInChain = &CanvasSrc.chain;
+	Viewport->Surface = wgpuInstanceCreateSurface(Instance, &SurfDesc);
+	UE_LOG(LogDawnRHI, Warning, TEXT("DawnRHI: RHICreateViewport %ux%u surface=%p"), Viewport->Width, Viewport->Height, (void*)Viewport->Surface);
+	if (Viewport->Surface)
+	{
+		WGPUSurfaceConfiguration Config = {};
+		Config.device = Device;
+		Config.format = Viewport->Format;
+		Config.usage = WGPUTextureUsage_RenderAttachment;
+		Config.width = Viewport->Width;
+		Config.height = Viewport->Height;
+		Config.alphaMode = WGPUCompositeAlphaMode_Opaque; // canvas ignores menu alpha (was Auto -> composited transparent against black page)
+		Config.presentMode = WGPUPresentMode_Fifo;
+		wgpuSurfaceConfigure(Viewport->Surface, &Config);
+	}
+	ActiveViewportRHI = Viewport;
+	return Viewport;
+}
+
+void FDawnDynamicRHI::RHIEndDrawingViewport(FRHICommandListImmediate& RHICmdList, FRHIViewport* ViewportRHI, FRHIPresentArgs const& PresentArgs)
+{
+	// Backbuffer rotation/present is driven per-frame from RHIEndFrame on this setup
+	// (this viewport present fires only occasionally). Nothing to do here.
+	(void)ViewportRHI;
+}
+
+void FDawnDynamicRHI::RHIResizeViewport(FRHIViewport* ViewportRHI, uint32 SizeX, uint32 SizeY, bool bIsFullscreen, EPixelFormat PixelFormat)
+{
+	FDawnViewport* Viewport = static_cast<FDawnViewport*>(ViewportRHI);
+	Viewport->Width = FMath::Max<uint32>(SizeX, 1);
+	Viewport->Height = FMath::Max<uint32>(SizeY, 1);
+	Viewport->BackBuffer.SafeRelease();
+	if (Viewport->Surface)
+	{
+		WGPUSurfaceConfiguration Config = {};
+		Config.device = Device;
+		Config.format = Viewport->Format;
+		Config.usage = WGPUTextureUsage_RenderAttachment;
+		Config.width = Viewport->Width;
+		Config.height = Viewport->Height;
+		Config.alphaMode = WGPUCompositeAlphaMode_Opaque; // canvas ignores menu alpha (was Auto -> composited transparent against black page)
+		Config.presentMode = WGPUPresentMode_Fifo;
+		wgpuSurfaceConfigure(Viewport->Surface, &Config);
+	}
+}
+
+
+
+
+
+void FDawnDynamicRHI::RHITick(float DeltaTime)
+{
+	// per-frame no-op
+}
+
+bool FDawnDynamicRHI::RHIGetAvailableResolutions(FScreenResolutionArray& Resolutions, bool bIgnoreRefreshRate)
+{
+	checkNoEntry();
+	return false;
+}
+
+void FDawnDynamicRHI::RHIGetSupportedResolution(uint32& Width, uint32& Height)
+{
+	checkNoEntry();
+}

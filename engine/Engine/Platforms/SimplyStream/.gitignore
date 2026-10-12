@@ -1,0 +1,29 @@
+# SimplyStream platform extension — ignore rules.
+#
+# When this tree was inlined in the engine, UE's root .gitignore (Binaries/,
+# Intermediate/, Saved/, DerivedDataCache/, obj/) plus the engine fork's custom
+# rules (emsdk/, Platforms/Binaries/) hid all build output and provisioned inputs.
+# As a standalone submodule this tree inherits NONE of that, so the rules live here.
+
+# --- Provisioned build inputs (overlaid at build time; not platform source) ---
+/emsdk/
+/simplystream-cli
+Source/ThirdParty/Dawn/lib/
+
+# --- UE build output (matches at any depth) ---
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+
+# --- .NET program build output (UBT / AutomationTool) ---
+obj/
+
+# --- OS / editor local files ---
+.DS_Store
+.clangd
+
+# --- Node tooling ---
+Tools/webgpu-verify/node_modules/
+!*.mjs
+Tools/webgpu-doctor/node_modules

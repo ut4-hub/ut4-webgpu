@@ -1,0 +1,213 @@
+; wndr deploy-nonce 2026-07-09b: remove the shader-preload diagnostic cvar and restage this device profile.
+; wndr deploy-nonce 2026-07-09a: bump to bust cookFp so the cook re-runs and re-stages this device profile.
+; wndr deploy-nonce 2026-06-21b: bump to bust cookFp so the cook re-runs and re-stages this device profile.
+;   (Removed the au.AudioMixerModuleName "NoSuchModule" diagnostic — the runaway audio queue is now fixed at the
+;    root in WasmAudioMixer.cpp by driving ReadNextBuffer() via the engine null-device pump. Audio must load
+;    normally for that fix to run, so the diagnostic that disabled the mixer module is gone.)
+; wndr deploy-nonce 2026-06-18a: bump to bust cookFp so the cook re-runs and re-stages this device profile.
+; (2026-06-18: r.InstanceCulling.AllowInstanceOrderPreservation=0 + r.WebGPU.OverLimitDiagnostics=1 are runtime
+; cvars that don't change the cooked shader payload, so the cook short-circuits -stage without a nonce bump.)
+; compute-raster + TSR-fp16 are RUNTIME cvars that don't change the cooked shader payload, so without this the
+; cook short-circuits and the staged/deployed device profile stays stale (see the cook-runner staged-config
+; purge that re-lays config from source each cook).
+[DeviceProfiles]
++DeviceProfileNameAndTypes=SimplyStream,SimplyStream
+
+[SimplyStream DeviceProfile]
+DeviceType=SimplyStream
+BaseProfileName=
++CVars=r.RefractionQuality=3
++CVars=sg.EffectsQuality=3
++CVars=r.WarnOfBadDrivers=0
++CVars=r.VirtualTextures=0
+; r.Mobile.VirtualTextures is deprecated in UE 5.8 (use r.VirtualTextures, set above) — keeping it fires an
+; ensure (LogOutputDevice: Error: "r.Mobile.VirtualTextures is deprecated ..."), which the cloud verify treats
+; as a fatal. VT is already disabled via r.VirtualTextures=0 above, so this line is redundant; removed.
++CVars=r.Shadow.Virtual.Enable=0
+; WebGPUShaderFormat reads this at cook time and emits the matching TransmittanceLutUAV storage format. Changing it requires a recook.
++CVars=r.SkyAtmosphere.TransmittanceLUT.UseSmallFormat=1
+;+CVars=r.AllowOcclusionQueries=0
+; wndr: must match DefaultEngine.ini [SystemSettings] (=1) so cook==runtime; =1 enables GPUScene (mobile UBO path)
++CVars=r.Mobile.SupportGPUScene=1
+; wndr: r.GenerateMeshDistanceFields is now per-project (project DefaultEngine.ini), not the device profile.
++CVars=r.RayTracing=False
++CVars=r.RayTracing.Enable=False
++CVars=r.Lumen.HardwareRayTracing=False
+; wndr (ported from 6.0): Nanite is left to the ENGINE DEFAULT (enabled) so each PROJECT opts in/out via its own
+; r.Nanite.ProjectEnabled (Project Settings > Rendering > Nanite). The platform must NOT force it on for
+; every project (a project targeting WebGPU may need it off, e.g. while the cluster-cull WGSL toolchain
+; gap is fixed). ComputeRasterization stays configured for projects that DO use Nanite: Phase 3 re-enabled
+; the compute micropoly rasterizer now that wave ops + 64-bit image atomics are supported (HW raster was
+; the bring-up fallback).
++CVars=r.Nanite.ComputeRasterization=1
+; wndr Nanite Phase 2 bring-up: the Nanite streaming pool must fit WebGPU's largest buffer allocation.
+; GetMaxPagePoolSizeInMB() = min(2048, maxStorageBufferBindingSize) and the SM5-capable WebGPU adapters
+; we target report 256MB, so the default 512MB pool trips a Fatal (NaniteStreamingManager.cpp:660).
+; 128MB streaming leaves the rest for root pages and stays well under the 256MB floor.
++CVars=r.Nanite.Streaming.StreamingPoolSize=128
+; wndr: GPU instance culling. Disabled at bring-up; its main blocker BUG-1 (RDG bAllowRHIAccess abort on
+; InstanceCulling.DrawIndirectArgsBuffer) is fixed by r.RDG.ParallelMobile=1 below (RDG sets the async-RHI-access
+; gate). Re-enabled to recover GPU-driven instance culling. WATCH BUG-10: InstanceCulling.InstanceIdsBuffer bound
+; as Storage against a Uniform buffer layout -- recent "clean" logs were with culling OFF, so this may re-surface;
+; if so the fix is RHI bind-layout/buffer-usage consistency (do NOT suppress validation).
++CVars=r.CullInstances=1
+; wndr: DISABLE GPU instance order-preservation on WebGPU SM5. It drives FInstanceCompactionDim
+; (ENABLE_INSTANCE_COMPACTION) on FBuildInstanceIdBufferAndCommandsFromPrimitiveIdsCs, which compiles in 3 extra
+; storage buffers (DrawCommandCompactionData SRV + CompactInstanceIdsBufferOut/CompactionBlockCounts UAVs). That
+; pushes the shader to 11 storage buffers/stage, over maxStorageBuffersPerShaderStage=10 on Apple/Metal WebGPU
+; adapters. The RHI then marks the pipeline ExceedsDeviceLimits and SILENTLY SKIPS the dispatch
+; (WebGPUCommands.cpp IsCurrentPipelineUsable -> RecordComputeSkip) -- no validation error, but the visible-instance
+; ID buffer / indirect args are never built, so most instanced (GPUScene) geometry never renders ("mostly empty").
+; =0 selects the no-compaction permutation (already compiled; pure runtime selection, no recook). Tradeoff: GPU
+; draw-order compaction is lost (possible translucent/masked instance sort order), acceptable vs. dropped geometry.
++CVars=r.InstanceCulling.AllowInstanceOrderPreservation=0
+; wndr: keep WebGPU over-limit diagnostics ON by default for dev. Emits bounded ([..MaxEvents]=256, so no flood)
+; JSONL [WebGPUOverLimit] console events whenever a shader layout is rejected or an over-limit draw/dispatch is
+; silently skipped (the failure mode that drops instanced geometry). Always-on visibility for dev cooks; the
+; SimplyStream cook config is Development. If a Shipping cook is ever added, gate this off there
+; (e.g. a !UE_BUILD_SHIPPING default on WebGPUOverLimitDiagnostics::GEnabled in WebGPURHI.cpp).
++CVars=r.WebGPU.OverLimitDiagnostics=1
+; wndr 2026-06-20 DIAGNOSTIC (remove for the no-regression validation cook): clamp the storage-buffer limit used
+; by the storage->uniform virtualization to 10 so the fleet doctor on a T4 (real limit >=16) reproduces the
+; 10-buffer Metal path. On a real 10-buffer adapter this is a no-op (min(10,10)=10) — behaviorally identical to
+; not setting it — so it does NOT change what the user sees on Metal. A 16-buffer device WOULD start virtualizing
+; under this, so drop this line before claiming no-regression on capable adapters.
++CVars=r.WebGPU.ForceMaxStorageBuffersPerStage=10
+; wndr BUG-1: this RHI is non-bypass and resolves FRDGBuffer::GetRHI() during deferred command translation on the RHI
+; worker thread, AFTER RDG closes its per-pass window on the render thread -> dev-only RenderGraphValidation fires on
+; e.g. InstanceCulling.DrawIndirectArgsBuffer. The engine's intended signal for an RHI that resolves off the render
+; thread is GRDGAllowRHIAccessAsync, which RDG sets only when parallel execute is enabled. For the mobile (ES3_1)
+; feature level that gate is r.RDG.ParallelMobile (IsParallelMobileEnabled); =1 makes RDG set the async-access gate so
+; the worker's late resolves are allowed (and turns on RDG parallel pass execution, stable on this content).
++CVars=r.RDG.ParallelMobile=1
+; wndr: parallel mesh-draw-command setup. Was disabled (=0) defensively with the other parallelism knobs when the
+; RHI wasn't parallel-safe. Now that RDG parallel execute works (r.RDG.ParallelMobile=1 above exercises parallel
+; command-context recording), this runs clean too — verified headless: 999 frames, 0 aborts/asserts. It's CPU-side
+; (device-agnostic), so re-enabled (=1) for the per-draw CPU win.
++CVars=r.MeshDrawCommands.ParallelPassSetup=1
++CVars=r.MotionBlur.AllowExternalVelocityFlatten=0
+; wndr: TSR sub-features restored to quality defaults (were defensively 0 when TSR was off). Re-validate on WebGPU.
++CVars=r.TSR.RejectionAntiAliasingQuality=2
++CVars=r.TSR.ReprojectionField=1
+; wndr: Resurrection must stay OFF on WebGPU. The TSR closest-depth writer is RWTexture2D<float2> while the
+; stock texture PF is 1-channel whenever bCanResurrectHistory is false -- and that flag flips per-frame
+; (camera cuts, early accumulation), so no single storage format can satisfy both. With it pinned to 0 the
+; texture is always 1-channel and the cooker narrows the writer to r32float (see GStorageFormatOverrides
+; 'TSR ClosestDepthOutput->r32'). Replaces the old forced-PF_G32R32F engine edit (B11). Also saves history
+; Texture2DArray slices = wasm memory.
++CVars=r.TSR.Resurrection=0
++CVars=r.TSR.ShadingRejection.Flickering=1
+; wndr: TSR's 16-bit VALU (fp16 tsr_half) path now renders correctly on WebGPU SM5 after the libtintw
+; f16<->int16 bitcast width-mask fix (dawn2, 6d6375b8). The r.TSR.16BitVALU=0 fp32 workaround is no longer
+; needed, so TSR runs its faster fp16 math path (engine default = on). (Recovers the intent of the orphaned
+; engine commit 091869b402ca, which dropped this workaround but never landed on 5.8.)
++CVars=r.CapsuleIndirectShadows=0
++CVars=r.Histogram.UseAtomic=0
++CVars=r.DFShadowScatterTileCulling=0
++CVars=r.AOGlobalDistanceField=0
++CVars=r.HairStrands.Voxelization=0
++CVars=r.ShaderPipelineCache.Enabled=0
+; Preload material shader maps so first-use Slate and scene draws do not repeatedly start and abandon
+; optional IAS shader-group reads. IAS still fetches only ranges for shader maps referenced by loaded assets.
++CVars=r.ShaderCodeLibrary.PreloadShaderMaps=1
++CVars=r.MotionBlur.AllowExternalVelocityFlatten=0
++CVars=r.TranslucencyLightingVolume=0
++CVars=r.VolumetricFog.TemporalReprojection=0
+; wndr-todo: We should be able to support skin shaders - but somethings going on.
++CVars=r.SkinCache.Allow=0
++CVars=r.SkinCache.CompileShaders=0
++CVars=r.SkinCache.Mode=0
+;+CVars=r.DisableDistortion=1
++Cvars=r.Substrate=0
+; Requires geometry shader support
++CVars=r.AllowPointLightCubemapShadows=0
++CVars=r.LightFunctionAtlas.Format=1
+
+; Optimize Slate signed distance field text for performance
++CVars=UI.SlateSDFText.RasterizationMode=SdfApproximation
++CVars=UI.SlateSDFText.ResolutionLevel=1
+; LightGrid Settings
++CVars=r.Forward.LightLinkedListCulling=0
+; Scale the LODDistanceFactor when doing a sky light capture
++CVars=r.SkylightCapture.LODDistanceScale=2
+; Prime the first audio streaming chunk when sound waves load. UE's default LoadOnDemand path can block long enough
+; on wasm streamed content to emit LogAudioStreamCaching "Still Waiting for Sound" warnings during launch cleanup.
++CVars=au.streamcache.SoundWaveDefaultLoadingBehavior=2
+
+; Disable GPU particles until WebGPU supports more buffers or emulated ubos enabled
++CVars=fx.NiagaraAllowGPUParticles=0
++CVars=FX.AllowGPUSorting=0
+; 2026-07-05 (resolved): the second-join freeze was NOT the frame sync — root cause was
+; the session-layer register-failure path (leaves wrecking membership + duplicate-join 400,
+; both fixed: fallback grace window + idempotent backend /join). GTSyncType/pipes/bundling
+; overrides trialed during the hunt are reverted to stock.
++CVars=r.GTSyncType=1
+; 2026-07-05: the render thread ran in explicit-wakeup mode because the engine's polling
+; default (TaskGraph.RenderThreadPollPeriodMs cvar default=1) never APPLIES unless the
+; cvar is explicitly set (the Core globals default to polling OFF and the delegate does
+; not fire at construction). Field freezes = frame-end fence starving while the render
+; thread sleeps on a queue it believes empty; polling re-checks the queue every 1ms and
+; is immune to lost wakeups. Set it explicitly.
++CVars=TaskGraph.RenderThreadPollPeriodMs=1
+; wndr BUG-18: hardware occlusion results were consumed 2+ frames stale with no bounds-expansion masking, so
+; meshes popped in/out while moving at wasm frame rates. webgpu-doctor occlusion capture verified the WebGPU RHI
+; query path is correct and readbacks complete sub-frame (~13ms median after resolve), so buffer a single frame
+; (the ES3_1 mobile path still auto-adds its extra frame in FOcclusionQueryHelpers::GetNumBufferedFrames) and
+; expand tested boxes in screen space to mask the remaining latency. Expansion only costs conservative overdraw.
++CVars=r.NumBufferedOcclusionQueries=1
++CVars=r.ExpandAllOcclusionTestedBBoxesScreenSpace=32
++CVars=r.ExpandNewlyOcclusionTestedBBoxesScreenSpace=96
+
++CVars=r.DetailMode=0
+; Cook out  emitters that don't match the device's detail mode
++CVars=fx.PruneEmittersOnCookByDetailMode=1
++CVars=r.CookOutUnusedDetailModeComponents=1
+
+; Default all devices to 30fps vsync
+;+CVars=r.VSync=1
+;+CVars=Lyra.DeviceProfile.Mobile.DefaultFrameRate=30
+
+
+;+CVars=r.RDG.ParallelSetup=0
+; Keep parallel pass recording but await completion on the render thread, avoiding the shader
+; preload deadlock caused by cross-frame async RDG execution.
++CVars=r.RDG.ParallelExecute=1
+; Keep RDG validation out of production builds for runtime cost. Strata doctor enables it explicitly;
+; SimplyStreamToolChain patches RenderCore's nested RHI-access state so those diagnostics remain usable.
++CVars=r.RDG.Validation=0
+
++CVars=r.Histogram.UseAtomic=0
+; wndr: TSR (=4). SM5 runs TSR (bSupportsGen5TemporalAA=true); ES31 (no Gen5) auto-downgrades (FXAA) at runtime.
++CVars=r.AntiAliasingMethod=4
++CVars=r.DefaultFeature.AntiAliasing=4
+; wndr: HZB built via compute (faster) — was disabled when WebGPU compute wasn't solid; verified clean now
+; (999 frames, 0 validation errors) with real content. Re-enabled.
++CVars=r.HZB.BuildUseCompute=1
++CVars=r.Substrate=0
+; Should be fine to remove this one?
++CVars=r.DisableDistortion=1
+
+;+CVars=r.WebGPU.RHIThread=0
+
+; Enable these one TextureFormatsTier1 is supported in Chrome
+; We could hack it today by using rgba8 instead of r8, but the added memory bandwidth cost is not worth it.
+;+CVars=r.VolumetricFog=0
+; wndr: r.DistanceFields is now a platform default in BaseSimplyStreamEngine.ini RendererSettings (cook+runtime read it).
+
+; Texture streaming (PLATFORM_SUPPORTS_TEXTURE_STREAMING=1). Set an explicit pool so streaming actually
+; evicts — GTexturePoolSize=0 (WebGPURHI) alone means an unbounded pool (no memory win). LimitPoolSizeToVRAM=0
+; because WebGPU exposes no VRAM fence, so honor the explicit pool. Tune PoolSize (MB) to the wasm heap budget:
+; lower = less memory, more pop-in.
++CVars=r.TextureStreaming=1
++CVars=r.Streaming.PoolSize=256
++CVars=r.Streaming.LimitPoolSizeToVRAM=0
+
+[SimplyStreamServer DeviceProfile]
+DeviceType=SimplyStream
+BaseProfileName=SimplyStream
+MeshLODSettings=
+TextureLODSettings=
++CVars=AsyncTraceDelegateHitchThresholdMS=7.0
+
+[DeviceProfiles]
++DeviceProfileNameAndTypes=SimplyStreamServer,SimplyStream

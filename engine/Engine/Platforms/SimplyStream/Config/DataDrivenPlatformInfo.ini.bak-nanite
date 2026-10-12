@@ -1,0 +1,249 @@
+[DataDrivenPlatformInfo]
+bIsConfidential=false
+TargetSettingsIniSectionName=/Script/SimplyStreamRuntimeSettings.SimplyStreamRuntimeSettings
+Freezing_b32Bit=false
+; FPlatformTypeLayoutParameters::InitializeForCurrent keeps Clang's unlimited field alignment.
+Freezing_MaxFieldAlignment32=4294967295
+Freezing_MaxFieldAlignment64=4294967295
+Freezing_bAlignBases=false
+bIsInteractablePlatform=true
+bHasDedicatedGamepad=false
+bDefaultInputStandardKeyboard=true
+bInputSupportConfigurable=true
+DefaultInputType=MouseAndKeyboard
+bSupportsMouseAndKeyboard=true
+bSupportsGamepad=true
+bCanChangeGamepadType=true
+bSupportsTouch=true
+GlobalIdentifier=0DF604E112E4445280BEE1C74EB934B1
+;Windows:bIsEnabled=true
+bUsesHostCompiler=false
+bCanUseCrashReporter=false
+bUATClosesAfterLaunch=false
+PlatformGroupName=Mobile
+bIsEnabled=true
+
+
+[ShaderPlatform SP_WEBGPU_SM5]
+Language=WebGPU
+ShaderFormat=SF_WEBGPU_SM5
+ShaderPlatform=SP_WEBGPU_SM5
+FriendlyName=LOCTEXT("FriendlyShaderPlatformName_WEBGPU_SM5", "WebGPU SM5")
+bIsPC = true
+EnablesHLSL2021ByDefault=1
+MaxFeatureLevel=SM6
+; wndr 5.8: WebGPU compiles via SPIR-V (HLSL->DXC->SPIR-V->Tint->WGSL). This was unset (defaulting false),
+; which also makes RHISupportsGeometryShaders' SPIR-V exemption unable to fire.
+bIsSPIRV=true
+bSupportsMSAA = true
+bIsMetalMRT = false
+bIsMobile = false
+bIsConsole = false
+bIsAndroidOpenGLES = false
+;bSupportsDistanceFields requires either convert 3d texture to buffer or waiting for proper read_write texture support
+bSupportsDistanceFields = true
+bSupportsCapsuleShadows = true
+bSupportsVolumetricFog = true
+bSupportsIndexBufferUAVs = true
+bSupportsDiaphragmDOF = true
+; wndr: SM5 GPUScene = full desktop path — primitive/instance data in StructuredBuffer<float4> read in BOTH the
+; vertex and pixel stages. Needs bSupportsVertexShaderSRVs=true (else the VS reads zeros -> broken transforms).
+; The "r8 storage" note was wrong; the real blockers were two tintw codegen bugs (now fixed in /Users/robertstewart/Unreal/dawn)
+; + vertex-stage SRVs. WebGPU on Metal-3 allows read-only storage buffers in the vertex stage
+; (maxStorageBuffersPerShaderStage >= 8; this Dawn has no separate vertex-stage limit).
+bSupportsGPUScene = true
+bSupportsVertexShaderSRVs = true
+bSupportsManualVertexFetch=false
+bIsHlslcc = false
+; wndr: half-precision (f16) shaders. RuntimeDependent => the engine cooks BOTH 16-bit and 32-bit shader
+; permutations; passes (TSR, Lumen, DiaphragmDOF, ...) select the 16-bit one only on devices that report
+; GRHIGlobals.SupportsNative16BitOps (set from the WebGPU shader-f16 feature in WebGPURHI). Devices without f16
+; safely run the 32-bit permutation (= today's shaders). Needs the Tint reader's 16-bit-int fix (libtintw) so the
+; uint<->half conversions DXC emits (-enable-16bit-types) translate to WGSL.
+bSupportsRealTypes=RuntimeDependent
+bCompileSignalProcessingPipeline = true
+bSupportsTessellation = false
+;bSupportsHairStrandGeometry wait until we get >= 16 storage buffer support
+bSupportsHairStrandGeometry=false
+bSupportsMobileMultiView = false
+;bSupportsVolumeTextureCompression enable once webgpu gets support (soon)
+bSupportsVolumeTextureCompression = false
+bSupportsRGBColorBuffer = true
+;bSupports4ComponentUAVReadWrite enable once vulkan gets support
+bSupports4ComponentUAVReadWrite = false
+;bSupportsRenderTargetWriteMask enable once vulkan gets support
+bSupportsRenderTargetWriteMask = false
+bSupportsByteBufferComputeShaders = true
+; wndr Nanite Phase 2: emulated 64-bit image atomics (cooker RWTexture2D<uint2>->RWStructuredBuffer<uint> rewrite +
+; RHI buffer-backed Atomic64 VisBuffer64 + prelude bounded-retry CAS ImageInterlockedMaxUInt64). SM5 only; ES3_1 stays false.
+bSupportsUInt64ImageAtomics = true
+bSupportsTemporalHistoryUpscale = false
+bSupportsRTIndexFromVS = false
+bRequiresExplicit128bitRT = false
+; wndr: TSR (Gen5) enabled on SM5 ONLY (ES31 stays false; TSR is SM5+). Atomic scatter emulated plugin-side (cooker rewrite + RHI buffer-backing).
+bSupportsGen5TemporalAA = true
+bTargetsTiledGPU = false
+bNeedsOfflineCompiler = false
+bSupportsDualSourceBlending = false
+bRequiresGeneratePrevTransformBuffer = false
+bRequiresRenderTargetDuringRaster = false
+bSupportsPerPixelDBufferMask = false
+bSupportsVariableRateShading = false
+NumberOfComputeThreads = 64
+bSupportsDebugViewShaders=false
+bSupportsRayTracing=false
+bSupportsRayTracingShaders=false
+bSupportsInlineRayTracing=false
+bSupportsRayTracingProceduralPrimitive=false
+bSupportsRayTracingIndirectInstanceData=false
+bSupportsPathTracing=false
+bSupportsHighEndRayTracingReflections=false
+; wndr Nanite Phase 2 (HardwareOnly raster first light): VisBuffer64 64-bit atomics emulated plugin-side (RHI/prelude/cooker).
+; r.Nanite.ComputeRasterization=0 (device profile) forces HW raster, dodging wave ops (Phase 3). Was: "enable once we get bSupportsWaveOperations".
+bSupportsNanite=true
+;bSupportsLumenGI enable once we get bSupportsWaveOperations and bSupportsUInt64ImageAtomics
+bSupportsLumenGI=false
+bSupportsComputeFramework=true
+;bSupportsSSDIndirect enable when vulkan gets support
+bSupportsSSDIndirect=false
+; wndr Nanite Phase 3 (pulled forward -- confirms N7-Q2): even HardwareOnly raster needs wave ops. Nanite binning
+; (NaniteRasterizer/NaniteShadeBinning: WaveBallot/WavePrefixSum/WaveGetLaneIndex) requires them, so they're a
+; prerequisite for first light, not a later step. RuntimeDependent opens the COOK gate (compile wave-op +
+; CFLAG_Wave32 permutations, flow CFLAG_WaveOperations -> PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS in the cooker;
+; Tint already lowers SPIR-V GroupNonUniform -> WGSL subgroup builtins). Runtime go/no-go = GRHISupportsWaveOperations
+; from the WebGPU 'subgroups' device feature (WebGPURHI). Min=Max=32 matches Apple metal-3's fixed 32-lane subgroup
+; (and Nanite's 32-lane SW-raster assumption), so the CFLAG_Wave32 permutations cook (ShouldCompileWithWaveSize).
+bSupportsWaveOperations=RuntimeDependent
+MinimumWaveSize=32
+MaximumWaveSize=32
+bSupportsDxc=true
+bRequiresVendorExtensionsForAtomics=false
+bSupportsAnisotropicMaterials=true
+bSupportsMeshShadersTier0=false
+bSupportsMeshShadersTier1=false
+;bSupportsFFTBloom can be enabled once we figure out how to get around the safe way unreal does workgroups that wgsl currently doesnt allow
+bSupportsFFTBloom=false
+; wndr 5.8: report VS-layer support so the engine COOKS and ENABLES the onepass point/rect cube-shadow
+; path (DoesRuntimeSupportOnePassPointLightShadows requires it). WebGPU has no real VS-layer / layer
+; routing; WebGPURHI emulates layered rendering by replaying each pass once per slice. Paired with
+; GRHISupportsArrayIndexFromAnyShader=true in WebGPURHI.cpp so the engine takes the instanced VS path.
+bSupportsVertexShaderLayer=true
+bSupportsInstancedStereo=false
+bSupportsPercentageCloserShadows=true
+;bSupportsClipDistance can be enabled if extension is available
+bSupportsClipDistance=false
+bSupportsIndependentSamplers=true
+
+[ShaderPlatform SP_WEBGPU_ES31]
+Language=WebGPU
+ShaderFormat=SF_WEBGPU_ES31
+ShaderPlatform=SP_WEBGPU_ES31
+FriendlyName=LOCTEXT("FriendlyShaderPlatformName_WEBGPU_ES31", "WebGPU ES 3.1")
+bIsMobile = true
+MaxFeatureLevel=ES3_1
+; wndr 5.8: WebGPU compiles via SPIR-V (HLSL->DXC->SPIR-V->Tint->WGSL).
+bIsSPIRV=true
+bIsMetalMRT = false
+bIsPC = true
+EnablesHLSL2021ByDefault=1
+bIsConsole = false
+bIsAndroidOpenGLES = false
+; wndr: half-precision (f16) shaders — see the SM5 section above. RuntimeDependent => cook both 16/32 permutations,
+; runtime-select on GRHIGlobals.SupportsNative16BitOps (device shader-f16). No-f16 devices use the 32-bit path.
+bSupportsRealTypes=RuntimeDependent
+bSupportsDistanceFields = false
+bSupportsCapsuleShadows = false
+bSupportsVertexShaderSRVs=false
+bSupportsVolumetricFog = false
+bSupportsIndexBufferUAVs = false
+bSupportsDiaphragmDOF = false
+; wndr: GPUScene on ES3_1 (mobile) uses the uniform-buffer-view path — primitive data is delivered via a
+; bounded UBO (PlatformGPUSceneUsesUniformBufferView, gated by bSupportsUniformBufferObjects below), so NO
+; vertex-stage storage buffers are needed (the WebGPU-friendly route). UseGPUScene() for mobile is driven by
+; r.Mobile.SupportGPUScene (set =1 in the project DefaultEngine.ini [SystemSettings]); the bSupportsGPUScene
+; DDSPI bit is NOT consulted on the mobile path, so it stays false here.
+bSupportsGPUScene = false
+bSupportsUniformBufferObjects=true
+bSupportsManualVertexFetch=false
+bIsHlslcc = false
+bCompileSignalProcessingPipeline = false
+bSupportsTessellation = false
+bSupportsHairStrandGeometry=false
+bSupportsMobileMultiView = false
+bSupportsVolumeTextureCompression = false
+bSupportsRGBColorBuffer = true
+bSupports4ComponentUAVReadWrite = false
+bSupportsRenderTargetWriteMask = false
+bSupportsRayTracing = false
+bSupportsRayTracingIndirectInstanceData = false
+bSupportsByteBufferComputeShaders = true ; wndr: GPUScene mobile UBO is filled by an instance-culling compute shader (also set below)
+bSupportsUInt64ImageAtomics = false
+bSupportsTemporalHistoryUpscale = false
+bSupportsRTIndexFromVS = false
+bRequiresExplicit128bitRT = false
+bSupportsGen5TemporalAA = false
+bTargetsTiledGPU = false
+bNeedsOfflineCompiler = false
+bSupportsDualSourceBlending = false
+bRequiresGeneratePrevTransformBuffer = false
+bRequiresRenderTargetDuringRaster = false
+bSupportsPerPixelDBufferMask = false
+bSupportsVariableRateShading = false
+NumberOfComputeThreads = 64
+bSupportsDebugViewShaders=false
+bSupportsRayTracing=false
+bSupportsRayTracingShaders=false
+bSupportsInlineRayTracing=false
+bSupportsRayTracingProceduralPrimitive=false
+bSupportsRayTracingIndirectInstanceData=false
+bSupportsPathTracing=false
+bSupportsHighEndRayTracingReflections=false
+bSupportsNanite=false
+bSupportsComputeFramework=false
+; wndr: the GPUScene mobile path fills the BatchedPrimitive UBO from an instance-culling COMPUTE shader, so
+; ES3_1 needs byte-buffer compute enabled (WebGPU supports compute — same device as SM5).
+bSupportsByteBufferComputeShaders=true
+bSupportsLumenGI=false
+bSupportsSSDIndirect=false
+bSupportsWaveOperations=Unsupported
+bSupportsDxc=false
+bSupportsDiaphragmDOF=false
+bRequiresVendorExtensionsForAtomics=false
+bSupportsAnisotropicMaterials=false
+bSupportsGen5TemporalAA=false
+bSupportsMeshShadersTier0=false
+bSupportsMeshShadersTier1=false
+bSupportsFFTBloom=false
+; wndr 5.8: report VS-layer support so the engine COOKS and ENABLES the onepass point/rect cube-shadow
+; path (DoesRuntimeSupportOnePassPointLightShadows requires it). WebGPU has no real VS-layer / layer
+; routing; WebGPURHI emulates layered rendering by replaying each pass once per slice. Paired with
+; GRHISupportsArrayIndexFromAnyShader=true in WebGPURHI.cpp so the engine takes the instanced VS path.
+bSupportsVertexShaderLayer=false
+bSupportsInstancedStereo=false
+bSupportsPercentageCloserShadows=false
+bSupportsIndexBufferUAVs=false
+bSupportsClipDistance=false
+bSupportsIndependentSamplers=true
+
+[PreviewPlatform WEBGPU_ES31]
+EnabledCVar=true
+PlatformName=SimplyStream
+ShaderPlatform=SP_WEBGPU_ES31
+ShaderFormat=SF_WEBGPU_ES31
+ActiveIconName=LevelEditor.PreviewMode.AndroidVulkan.Enabled
+InactiveIconName=LevelEditor.PreviewMode.AndroidVulkan.Disabled
+MenuTooltip=NSLOCTEXT("PreviewPlatform", "PreviewMenuTooltip_WEBGPU_ES31", "Mobile preview using WebGPU ES31 quality settings.")
+IconText=NSLOCTEXT("PreviewPlatform", "PreviewIconText_WEBGPU_ES31", "SimplyStream WebGPU ES31")
+DeviceProfileName=SimplyStream_Preview_WebGPU_ES31
+
+[PreviewPlatform WEBGPU_SM5]
+EnabledCVar=true
+PlatformName=SimplyStream
+ShaderPlatform=SP_WEBGPU_SM5
+ShaderFormat=SF_WEBGPU_SM5
+PreviewFeatureLevel=SM5
+ActiveIconName=LevelEditor.PreviewMode.AndroidVulkanSM5.Enabled
+InactiveIconName=LevelEditor.PreviewMode.AndroidVulkanSM5.Disabled
+MenuTooltip=NSLOCTEXT("PreviewPlatform", "PreviewMenuTooltip_WEBGPU_SM5", "Desktop preview using SimplyStream WebGPU SM5 quality settings.")
+IconText=NSLOCTEXT("PreviewPlatform", "PreviewIconText_WEBGPU_SM5", "SimplyStream WebGPU SM5")
+DeviceProfileName=SimplyStream_Preview_WebGPU_SM5

@@ -1,0 +1,10 @@
+const tabs = await (await fetch('http://127.0.0.1:9333/json/list')).json();
+const t = tabs.find(x => x.id.startsWith(process.argv[2]));
+const ws = new WebSocket(t.webSocketDebuggerUrl);
+await new Promise(r => ws.addEventListener('open', r));
+let id = 0; const send = (method, params={}) => new Promise(res => { const i = ++id; ws.addEventListener('message', function h(ev){ const m = JSON.parse(ev.data); if (m.id === i) { ws.removeEventListener('message', h); res(m); } }); ws.send(JSON.stringify({ id: i, method, params })); });
+console.log('nav blank', JSON.stringify(await send('Page.navigate', { url: 'about:blank' })).slice(0,80));
+await new Promise(r => setTimeout(r, 2000));
+console.log('clearCache', JSON.stringify(await send('Network.clearBrowserCache')));
+console.log('clearStorage', JSON.stringify(await send('Storage.clearDataForOrigin', { origin: 'http://127.0.0.1:8091', storageTypes: 'all' })));
+process.exit(0);

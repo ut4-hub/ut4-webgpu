@@ -1,0 +1,144 @@
+// DawnRHI — IRHICommandContext backed by Dawn native (webgpu.h).
+//
+// Runs in "immediate" mode: every RHI* call below translates straight into a
+// Dawn command-encoder/render-pass-encoder call (no deferred command-list
+// recording/parallel translation). That is the deliberate Stage 1
+// simplification — real parallel translation is Stage 2+ work.
+//
+// Override list mechanically derived from RHIContext.h (both IRHIComputeContext
+// and IRHICommandContext pure virtuals, since IRHICommandContext : public
+// IRHIComputeContext). Methods marked REAL in the .cpp have working bodies;
+// the rest are checkNoEntry() stubs — see the module's stub manifest.
+#pragma once
+
+#include "DawnRHIPrivate.h"
+#include "DawnResources.h"
+
+class FDawnDynamicRHI;
+
+class FDawnCommandContext final : public IRHICommandContext
+{
+public:
+	explicit FDawnCommandContext(FDawnDynamicRHI* InOwner);
+	virtual ~FDawnCommandContext();
+
+	virtual void RHISetComputePipelineState(FRHIComputePipelineState* ComputePipelineState) override;
+	virtual void RHIDispatchComputeShader(uint32 ThreadGroupCountX, uint32 ThreadGroupCountY, uint32 ThreadGroupCountZ) override;
+	virtual void RHIDispatchIndirectComputeShader(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override;
+	virtual void RHIBeginTransitions(TArrayView<const FRHITransition*> Transitions) override;
+	virtual void RHIEndTransitions(TArrayView<const FRHITransition*> Transitions) override;
+	virtual void RHIClearUAVFloat(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FVector4f& Values) override;
+	virtual void RHIClearUAVUint(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FUintVector4& Values) override;
+	virtual void RHISetShaderParameters(FRHIComputeShader* ComputeShader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters) override;
+	virtual void RHISetStaticUniformBuffers(const FUniformBufferStaticBindings& InUniformBuffers) override;
+	virtual void RHISetStaticUniformBuffer(FUniformBufferStaticSlot Slot, FRHIUniformBuffer* UniformBuffer) override;
+#if WITH_RHI_BREADCRUMBS
+	// Pre-existing latent bug fixed incidentally this session: RHIContext.h
+	// only declares these two pure virtuals when WITH_RHI_BREADCRUMBS is set
+	// (off in a Shipping build without WITH_PROFILEGPU/HAS_GPU_STATS — see
+	// RHIBreadcrumbs.h) but this override list was unconditional, so
+	// FRHIBreadcrumbNode (only visible when RHIBreadcrumbs.h's guarded
+	// content is compiled in) went undeclared and DawnRHI failed to compile
+	// in Shipping. Match the base class's own guard exactly.
+	virtual void RHIBeginBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb) override;
+	virtual void RHIEndBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb) override;
+#endif
+	virtual void RHISetMultipleViewports(uint32 Count, const FViewportBounds* Data) override;
+	virtual void RHIBeginRenderQuery(FRHIRenderQuery* RenderQuery) override;
+	virtual void RHIEndRenderQuery(FRHIRenderQuery* RenderQuery) override;
+	virtual void RHISetStreamSource(uint32 StreamIndex, FRHIBuffer* VertexBuffer, uint32 Offset) override;
+	virtual void RHISetViewport(float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ) override;
+	virtual void RHISetScissorRect(bool bEnable, uint32 MinX, uint32 MinY, uint32 MaxX, uint32 MaxY) override;
+	virtual void RHISetGraphicsPipelineState(FRHIGraphicsPipelineState* GraphicsState, uint32 StencilRef, bool bApplyAdditionalState) override;
+	virtual void RHISetShaderParameters(FRHIGraphicsShader* Shader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters) override;
+	virtual void RHIDrawPrimitive(uint32 BaseVertexIndex, uint32 NumPrimitives, uint32 NumInstances) override;
+	virtual void RHIDrawPrimitiveIndirect(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override;
+	virtual void RHIDrawIndexedPrimitive(FRHIBuffer* IndexBuffer, int32 BaseVertexIndex, uint32 FirstInstance, uint32 NumVertices, uint32 StartIndex, uint32 NumPrimitives, uint32 NumInstances) override;
+	virtual void RHIDrawIndexedPrimitiveIndirect(FRHIBuffer* IndexBuffer, FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset) override;
+	virtual void RHISetDepthBounds(float MinDepth, float MaxDepth) override;
+	virtual void RHIBeginRenderPass(const FRHIRenderPassInfo& InInfo, const TCHAR* InName) override;
+	virtual void RHIEndRenderPass() override;
+	virtual void RHICopyTexture(FRHITexture* SourceTexture, FRHITexture* DestTexture, const FRHICopyTextureInfo& CopyInfo) override;
+	virtual void RHICopyBufferRegion(FRHIBuffer* DestBuffer, uint64 DstOffset, FRHIBuffer* SourceBuffer, uint64 SrcOffset, uint64 NumBytes) override;
+
+	// NOTE: RHISetBoundShaderState / RHISetDepthStencilState / RHISetRasterizerState /
+	// RHISetBlendState / RHIEnableDepthBoundsTest / RHISetComputeShader / the
+	// FGraphicsPipelineStateInitializer overload of RHISetGraphicsPipelineState
+	// are declared on IRHICommandContextPSOFallback (the legacy non-PSO
+	// state-setting path), not on IRHICommandContext itself — UBT/clang
+	// confirmed this (`does not override any member functions`) when they
+	// were mechanically included from the same header text. Stage 1 uses
+	// the modern baked-PSO path exclusively, so they're intentionally
+	// omitted rather than stubbed.
+
+	// Called by FDawnDynamicRHI::RHIFinalizeContexts/RHISubmitCommandLists.
+	void SubmitToQueue();
+	// WNDR frame-lifetime UB hold: release uniform buffers held alive across this frame's draws.
+	void WndrReleaseFrameHeldUBs();
+
+private:
+	FDawnDynamicRHI* Owner = nullptr;
+
+	WGPUCommandEncoder CommandEncoder = nullptr;
+	WGPURenderPassEncoder ActiveRenderPass = nullptr;
+	uint32 CurrentRTWidth = 0, CurrentRTHeight = 0; // for scissor-disable reset
+	bool bCurRTPresentable = false; // is the current render pass targeting the backbuffer?
+	// Multi-stream vertex input (black-world fix): one bound buffer per vertex
+	// STREAM slot (slot index == RHISetStreamSource's StreamIndex == the
+	// pipeline's vertex-buffer layout slot). Mesh vertex factories bind 3-4
+	// streams (position / UVs / color / tangents); the old single "last one
+	// wins" member made positions read from whichever stream was set last.
+	// 17 == UE's MaxVertexElementCount upper bound on stream indices.
+	static constexpr uint32 MaxVertexStreams = 17;
+	TRefCountPtr<FDawnBuffer> BoundVertexBuffers[MaxVertexStreams];
+	uint32 BoundVertexBufferOffsets[MaxVertexStreams] = {};
+	// STRIPIDX: true while the encoder has the current strip PSO's Uint32
+	// stripIndexFormat sibling (PipelineStrip32) bound instead of Pipeline.
+	// Cleared whenever RHISetGraphicsPipelineState rebinds the primary.
+	bool bStripAltPipelineBound = false;
+	// FRAGLESS: does the active render pass have a color attachment? A
+	// fragment-less (depth-only) pipeline drawn in a color pass is a Dawn
+	// attachment-compatibility error that would poison the command buffer.
+	bool bCurPassHasColor = false;
+	FDawnGraphicsPipelineState* CurrentPSO = nullptr; // non-owning; set by RHISetGraphicsPipelineState
+
+	// Static uniform buffers (RHISetStaticUniformBuffers) keyed by layout debug-name.
+	// Slate's ViewProjection lives in the static "SlateView" UB, bound here, NOT via
+	// RHISetShaderParameters -- so it must be injected into the bind group separately.
+	TMap<FString, FRHIUniformBuffer*> StaticUBsByName;
+
+	// Bind-group entries accumulated across the SEPARATE per-stage RHISetShaderParameters
+	// calls (VS + PS are distinct calls for material/scene draws). The bind group is built
+	// at DRAW time from all of them -- per-call creation is always partial. Cleared on
+	// RHISetGraphicsPipelineState.
+	TMap<uint32, TMap<uint32, WGPUBindGroupEntry>> PendingBindEntries;
+	TArray<WGPUBuffer> PendingTransientUBs;
+	// UBRESTABLE: uniform buffers delivered for the CURRENT PSO's draws —
+	// their captured resource tables provide the texture/sampler/SRV members
+	// (material albedo, lightmaps, bone matrices) at bind-group build. Same
+	// lifetime as PendingBindEntries (reset on PSO change).
+	TArray<TRefCountPtr<FRHIUniformBuffer>> PendingUBRefs;
+#if PLATFORM_WASM
+	// WNDR unified fix (2026-08-20): each draw moves its delivered UB refs HERE instead of
+	// releasing them, so (a) PendingUBRefs stays small per draw -> the bind-table walk is O(1)
+	// in batch size (kills the 30-75s streaming spikes), and (b) every UB touched this frame keeps
+	// a live ref -> its refcount never hits 0 mid-frame, so the deferred-delete flush can never set
+	// DeletingBit on a UB an in-flight SubmitMeshDrawCommandsRange AddRefs (RHIResources.h:189 abort).
+	// Released once per frame in WndrReleaseFrameHeldUBs() at RHIEndFrame, after the frame submits.
+	TArray<TRefCountPtr<FRHIUniformBuffer>> WndrFrameHeldUBs;
+#endif
+	// UBDELIV: every UB delivery (incl. NULLs) since the last PSO set, as
+	// "index:name" strings — dumped by the MATMISS diagnostic.
+	TArray<FString> UBDelivRing;
+	bool FlushPendingBindGroups();
+	// VTXRANGE: the draw's ranges (vertex range only known for non-indexed
+	// draws — pass NumVertices=0 for indexed, matching what Dawn validates)
+	// let the bind path skip a draw whose range exceeds a bound buffer instead
+	// of letting the Dawn validation error poison the whole command buffer.
+	bool BindVertexStreams(uint32 FirstVertex, uint32 NumVertices, uint32 FirstInstance, uint32 NumInstances);
+
+	void EnsureCommandEncoder();
+
+	virtual void RHICopyToStagingBuffer(FRHIBuffer* SourceBufferRHI, FRHIStagingBuffer* DestinationStagingBufferRHI, uint32 InOffset, uint32 InNumBytes) override;
+	virtual void RHIWriteGPUFence(FRHIGPUFence* FenceRHI) override;
+};

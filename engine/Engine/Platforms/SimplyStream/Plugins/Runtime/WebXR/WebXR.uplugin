@@ -1,0 +1,27 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "WebXR",
+	"Description": "WebXR head-mounted display support for the SimplyStream WebGPU/wasm platform. Activated with -webxr; the JS side (simplystream.js) owns the XRSession and feeds poses through a shared-memory snapshot.",
+	"Category": "Virtual Reality",
+	"CreatedBy": "SimplyStream",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"SupportedTargetPlatforms": [ "SimplyStream" ],
+	"Modules": [
+		{
+			"Name": "WebXRHMD",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [ "SimplyStream" ]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "XRBase",
+			"Enabled": true
+		}
+	]
+}

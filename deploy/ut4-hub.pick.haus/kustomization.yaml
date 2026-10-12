@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: websites
+
+# UT4 (UE 5.8) running in the browser via WebAssembly + WebGPU — playtest build.
+# Static files (~7.6 GB: wasm, JS loaders, ContentBootstrap*.data packs) live on a
+# ceph-block PVC and are uploaded by hand (tar over kubectl exec), not baked into
+# an image. nginx adds the cross-origin-isolation headers the game needs for
+# SharedArrayBuffer (pthreads) and serves HTTP Range for the multi-GB packs.
+resources:
+  - pvc.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - httproute.yaml

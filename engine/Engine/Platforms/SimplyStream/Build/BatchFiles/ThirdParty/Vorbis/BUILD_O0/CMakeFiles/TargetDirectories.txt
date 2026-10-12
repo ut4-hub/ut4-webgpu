@@ -1,0 +1,13 @@
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/CMakeFiles/edit_cache.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/CMakeFiles/rebuild_cache.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/CMakeFiles/list_install_components.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/CMakeFiles/install.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/CMakeFiles/install/local.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/vorbis.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/vorbisenc.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/vorbisfile.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/edit_cache.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/rebuild_cache.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/list_install_components.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/install.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/CMakeFiles/install/local.dir

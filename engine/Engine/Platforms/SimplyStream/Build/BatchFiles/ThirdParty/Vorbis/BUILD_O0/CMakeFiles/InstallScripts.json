@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/cmake_install.cmake",
+		"C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Vorbis/BUILD_O0/lib/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

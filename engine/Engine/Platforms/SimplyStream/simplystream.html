@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en-us">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Unreal</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+        }
+        body, html {
+            height: 100%;
+            padding: 0px;
+            font-family: arial;
+            margin: 0;
+        }
+        .emscripten {
+            padding-right: 0;
+            margin-left: auto;
+            margin-right: auto;
+            display: block;
+        }
+        canvas.emscripten {
+            top: 0px;
+            border: 0px none;
+            position: absolute;
+            height: 100%;
+            width: 100%;
+        }
+        body {
+            overflow-y: hidden;
+        }
+        #canvas-container {
+            height: 100%;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas class="emscripten" id="canvas" oncontextmenu="event.preventDefault()" tabindex=-1></canvas>
+    </div>
+    <div id="loading" style="position: absolute; width: 100%; height: 100%; display: none;"></div>
+    <script type='text/javascript'>
+		window.start_time = performance.now();
+		async function load_gameinfo(Module, r, r2, projectidandrev) {
+            if (r.status != 200) {
+                Module.prefetch = null;
+                console.error('Failed loading GameInfo');
+                return;
+			}
+			Module.gameinfodata = await r.arrayBuffer();
+			if (r2.status == 200)
+				Module.prefetch = await r2.arrayBuffer();
+			else
+                Module.prefetch = null;
+		}
+        const projectidandrev = window.parent.state.project_id + window.parent.state.project_rev;
+		// IAS revisions no longer consume game-info or the legacy VFS prefetch payload. Do not make those backend
+		// requests during startup; legacy revisions retain their existing bootstrap path unchanged.
+		const legacyBootstrapEnabled = !window.parent.state.ias;
+		const gameinfo = legacyBootstrapEnabled
+			? fetch(`https://${window.parent.state.platform_addr}/infos/${projectidandrev}`)
+			: Promise.resolve(null);
+		const prefetch = legacyBootstrapEnabled
+			? (window.parent?.fetchWithProgress || fetch)(`https://${window.parent.state.platform_addr}/prefetch/${projectidandrev}`)
+			: Promise.resolve(null);
+
+        window.log_status = document.getElementById("loading");
+        window.onerror = function myErrorHandler(errorMsg, url, lineNumber) {
+            console.error(errorMsg, url, lineNumber);
+        }
+        document.getElementById("canvas").width = window.innerWidth;
+		document.getElementById("canvas").height = window.innerHeight;
+		document.getElementById("canvas-container").width = window.innerWidth;
+		document.getElementById("canvas-container").height = window.innerHeight;
+		window.parent.state.session_id = window.parent.state.session_id || '00000000-0000-0000-0000-000000000000';
+
+        const query = new URLSearchParams(window.location.search);
+        function getQueryValue() {
+            for (const name of arguments) {
+                if (query.has(name)) {
+                    return query.get(name);
+                }
+            }
+            return null;
+        }
+        function isQueryEnabled(value) {
+            return value !== null && !/^(0|false|off|no)$/i.test(value);
+        }
+        // wndr webxr: opt-in via ?webxr=1. Capability probe runs async; preInit awaits it so the
+        // -webxr engine arg and Module.webxrEnabled are only set when an immersive-vr session is
+        // actually available (keeps non-XR sessions bit-identical, including the adapter request).
+        const webxrRequested = isQueryEnabled(getQueryValue('webxr', 'web-xr'));
+        const webxrSessionSupported = (webxrRequested && navigator.xr && navigator.xr.isSessionSupported)
+            ? navigator.xr.isSessionSupported('immersive-vr').catch(function () { return false; })
+            : Promise.resolve(false);
+        function getAssetRouting() {
+            const state = window.parent && window.parent.state;
+            const routing = (state && state.asset_routing) || {};
+            return {
+                primaryHost: routing.primary_host || (state && state.platform_addr) || '',
+                edgeBoostAssetHost: routing.edge_boost_asset_host || (state && state.edge_boost_asset_host) || '',
+                wasmBaseUrl: routing.wasm_base_url || '',
+                vfsAssetBaseUrl: routing.vfs_asset_base_url || (state && state.vfs_asset_base_url) || '',
+                ias: routing.ias || null
+            };
+        }
+        function getAssetRoutingUrl(baseUrl, path) {
+            return baseUrl ? `${baseUrl.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}` : '';
+        }
+        const assetRouting = getAssetRouting();
+        function getRuntimeIasConfig() {
+            const ias = (window.parent && window.parent.state && window.parent.state.ias) || null;
+            if (!ias || !assetRouting.ias) return ias;
+            return {
+                ...ias,
+                cdn: assetRouting.ias.selectedCdn || assetRouting.ias.primaryCdn || ias.cdn,
+                primaryCdn: assetRouting.ias.primaryCdn || ias.primaryCdn,
+                tocUrl: assetRouting.ias.selectedTocUrl || assetRouting.ias.primaryTocUrl || ias.tocUrl,
+                primaryTocUrl: assetRouting.ias.primaryTocUrl || ias.primaryTocUrl
+            };
+        }
+        var Module = {
+            // wndr IAS: the launcher sets state.ias = { cdn, tocUrl, bootsetUrl?, coalesce? } for IAS-enabled revisions.
+            // simplystream.js's wndrIasBoot reads Module.ias → appends the IAS engine args + registers the on-demand
+            // TOC + boot set before main. Null (legacy revisions) ⇒ untouched VFS boot.
+            assetRouting: assetRouting,
+            ias: getRuntimeIasConfig(),
+            vfs_asset_base_url: assetRouting.vfsAssetBaseUrl || '',
+            locateFile: function (path, prefix) {
+                if (/\.wasm$/i.test(path)) {
+                    const boosted = getAssetRoutingUrl(assetRouting.wasmBaseUrl, path);
+                    if (boosted) return boosted;
+                }
+                return (prefix || '') + path;
+            },
+            preRun: [
+                async function () {
+					Module['preRunTime'] = performance.now() - window.start_time;
+                }],
+            postRun: [],
+            preInit: [async function () {
+				Module['preInitTime'] = performance.now() - window.start_time;
+				if (legacyBootstrapEnabled) {
+					load_gameinfo(Module, await gameinfo, await prefetch, projectidandrev);
+				} else {
+					Module.gameinfodata = null;
+					Module.prefetch = null;
+				}
+				if (await webxrSessionSupported) {
+					Module.webxrEnabled = true;
+					Module.arguments = (Module.arguments || []).concat(['-webxr']);
+					console.log('[WebXR] immersive-vr supported; enabling WebXR runtime');
+				}
+                if (window.state)
+                    window.child = window;
+            }],
+            print: (function () {
+                return function (text) {
+                    if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+                    console.log(text);
+                };
+            })(),
+            printErr: function (text) {
+                if (arguments.length > 1) text = Array.prototype.slice.call(arguments).join(' ');
+				// Unreal's ANSI output device writes every verbosity to stderr. Emscripten normally maps
+				// stderr to console.error, which paints ordinary Log/Display startup output red and makes
+				// CDP diagnostics treat it as a failure. Preserve real severity while presenting routine UE
+				// stderr as normal console output.
+				var message = String(text);
+				if (/\bFatal error\b|Log[^:]*:\s*(?:Error|Fatal):|\bAborted\(|\bRuntimeError\b|\bUncaught\b|assertion failed|wasm trap|memory access out of bounds|Pthread .* sent an error/i.test(message)) {
+					console.error(message);
+				} else if (/Log[^:]*:\s*Warning:|^warning\b|ensure condition failed/i.test(message)) {
+					console.warn(message);
+				} else {
+					console.log(message);
+				}
+            },
+            canvas: (function () {
+                var canvas = document.getElementById('canvas');
+                return canvas;
+            })(),
+            totalDependencies: 0,
+            monitorRunDependencies: function (left) {
+                this.totalDependencies = Math.max(this.totalDependencies, left);
+            }
+        };
+        function saveLog() {
+            // deprecated
+        }
+    </script>
+    {{{ SCRIPT }}}
+
+</body>
+</html>

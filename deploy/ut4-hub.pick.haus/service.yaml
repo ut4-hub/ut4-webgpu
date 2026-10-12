@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ut4-hub-pick-haus
+  namespace: websites
+  labels:
+    app: ut4-hub-pick-haus
+spec:
+  selector:
+    app: ut4-hub-pick-haus
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

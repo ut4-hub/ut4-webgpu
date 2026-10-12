@@ -1,0 +1,133 @@
+threads: 33 2026-10-12T19:17:58.395Z
+profiling 33
+
+== em-pthread busy 100% of 6.5s
+  100.0%  __pthread_cond_timedwait
+  -- inclusive --
+  100.0%  __pthread_cond_timedwait
+  100.0%  FPThreadEvent::Wait(unsigned int, bool)
+  100.0%  FWndrProbedEvent::Wait(unsigned int, bool)
+  100.0%  (root)
+
+== em-pthread busy 99% of 6.5s
+   10.9%  FDawnCommandContext::FlushPendingBindGroups()
+    5.7%  __wrap_memcpy
+    3.8%  FDawnCommandContext::FlushPendingBindGroups()::$_1::operator()(FRHIUniformBuffer*) const
+    2.8%  createBindGroup
+    2.3%  (garbage collector)
+    2.1%  _emscripten_get_now
+    2.1%  bigintToI53Checked
+    1.4%  writeBuffer
+    1.2%  emscripten_builtin_free
+    1.2%  FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader*, TArrayView<unsigned char const, int>, TArrayV
+    1.1%  emscripten_builtin_malloc
+    1.0%  FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader*, TArrayView<unsigned char const, int>, TArrayV
+    1.0%  growMemViews
+    0.9%  getJsObject
+  -- inclusive --
+  100.0%  (root)
+   95.5%  SIMPLYSTREAM_Tick
+   95.5%  Module.channel.port1.onmessage
+   95.3%  FEngineLoop::Tick()
+   91.9%  UUTGameEngine::Tick(float, bool)
+   91.9%  UGameEngine::Tick(float, bool)
+   75.5%  js-to-wasm::
+   67.8%  FViewport::Draw(bool)
+   67.8%  UEngine::RedrawViewports(bool)
+   67.6%  UUTGameViewportClient::Draw(FViewport*, FCanvas*)
+   67.4%  UGameViewportClient::Draw(FViewport*, FCanvas*)
+   63.6%  FRendererModule::BeginRenderingViewFamilies(FCanvas*, TArrayView<FSceneViewFamily* const, int>)
+   63.6%  FRendererModule::BeginRenderingViewFamily(FCanvas*, FSceneViewFamily*)
+   62.1%  FSceneRenderProcessor::Execute()
+   62.0%  UE::Core::Private::Function::TFunctionRefCaller<FSceneRenderProcessor::Execute()::$_3, void, FRHICommandListImmediate&>:
+   51.1%  FRDGBuilder::Execute()
+   40.8%  FParallelMeshDrawCommandPass::Draw(FRHICommandList&, FInstanceCullingDrawParams const*) const
+   40.7%  SubmitMeshDrawCommandsRange(TArray<FVisibleMeshDrawCommand, TLinearArrayAllocatorBase<FSceneRenderingBlockAllocationTag,
+   35.4%  FRHICommandList::DrawIndexedPrimitive(FRHIBuffer*, int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned
+   35.3%  FDawnCommandContext::RHIDrawIndexedPrimitive(FRHIBuffer*, int, unsigned int, unsigned int, unsigned int, unsigned int, u
+   32.7%  FMobileSceneRenderer::RenderMobileBasePass(FRHICommandList&, FViewInfo const&, FInstanceCullingDrawParams const*, FInsta
+   32.7%  TRDGLambdaPass<FMobileRenderPassParameters, FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder&, FMobileRenderPass
+   30.8%  FDawnCommandContext::FlushPendingBindGroups()
+   30.7%  FMeshDrawCommand::SubmitDrawEnd(FMeshDrawCommand const&, FMeshDrawCommandSceneArgs const&, unsigned int, FRHICommandList
+   25.0%  UE::Tasks::Private::FTaskBase::TryExecuteTask()
+   24.1%  FNamedTaskThread::ProcessTasksNamedThread(int, bool)
+   24.1%  FTaskGraphCompatibilityImplementation::ProcessThreadUntilIdle(ENamedThreads::Type)
+   22.7%  UWorld::Tick(ELevelTick, float)
+   21.0%  UWorld::RunTickGroup(ETickingGroup, bool)
+   21.0%  FTickTaskManager::RunTickGroup(ETickingGroup, bool)
+   20.9%  FTickTaskSequencer::ReleaseTickGroup(ETickingGroup, bool, TArray<FTickFunction*, TSizedDefaultAllocator<32>>&)
+   20.8%  FTaskGraphCompatibilityImplementation::ProcessUntilTasksComplete(TArray<TRefCountPtr<FBaseGraphTask>, TSizedInlineAlloca
+   20.6%  TGraphTask<FTickFunctionTask>::ExecuteTask()
+   20.0%  js-to-wasm:ll:
+   18.1%  wasm-to-js
+   13.4%  FMobileSceneRenderer::Render(FRDGBuilder&, FSceneRenderUpdateInputs const*)
+   13.4%  FRendererModule::BeginRenderingViewFamilies(FCanvas*, TArrayView<FSceneViewFamily* const, int>)::$_3::__invoke(FRDGBuild
+   11.2%  FActorComponentTickFunction::ExecuteTick(float, ELevelTick, ENamedThreads::Type, TRefCountPtr<FBaseGraphTask> const&)
+   10.0%  FMeshDrawCommand::SubmitDrawBegin(FMeshDrawCommand const&, Experimental::TRobinHoodHashSet<FGraphicsMinimalPipelineState
+    9.1%  FRHICommandList::SetBatchedShaderParameters(FRHIGraphicsShader*, FRHIBatchedShaderParameters&)
+    8.6%  USkeletalMeshComponent::TickComponent(float, ELevelTick, FActorComponentTickFunction*)
+    8.6%  USkinnedMeshComponent::TickComponent(float, ELevelTick, FActorComponentTickFunction*)
+    8.5%  FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader*, TArrayView<unsigned char const, int>, TArrayView<FRHISh
+    8.1%  TRDGLambdaPass<FMobileRenderPassParameters, FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder&, FMobileRenderPass
+    7.9%  FMobileSceneRenderer::RenderTranslucency(FRHICommandList&, FViewInfo const&, TArrayView<FViewInfo, int>, ETranslucencyPa
+
+== em-pthread busy 100% of 6.4s
+  100.0%  __pthread_cond_timedwait
+    0.0%  wasm-to-js
+    0.0%  unlock
+  -- inclusive --
+  100.0%  (root)
+  100.0%  __pthread_cond_timedwait
+  100.0%  FPThreadEvent::Wait(unsigned int, bool)
+  100.0%  FWndrProbedEvent::Wait(unsigned int, bool)
+  100.0%  FSafeRecyclableEvent::Wait(unsigned int, bool)
+  100.0%  FEvent::Wait(FTimespan const&, bool)
+    0.0%  wasm-to-js
+    0.0%  PlatformUtcNow()
+    0.0%  unlock
+
+== em-pthread busy 100% of 6.5s
+   99.6%  ___emscripten_atomics_sleep
+    0.2%  _emscripten_get_now
+    0.1%  FHttpThreadBase::Process(TArray<FHttpRequestCommon*, TSizedDefaultAllocator<32>>&, TArray<FHttpRequestCommon*,
+    0.0%  wasm-to-js
+    0.0%  FTSTicker::Tick(float)
+    0.0%  now
+    0.0%  FSimplyStreamHttpRequest::TickThreadedRequest(float)
+    0.0%  FTaskTagScope::IsRunningDuringStaticInit()
+  -- inclusive --
+  100.0%  (root)
+   99.9%  wasm-to-js
+   99.6%  FSimplyStreamPlatformProcess::SleepNoStats(float)
+   99.6%  ___emscripten_atomics_sleep
+    0.3%  _emscripten_get_now
+    0.1%  FHttpThreadBase::Process(TArray<FHttpRequestCommon*, TSizedDefaultAllocator<32>>&, TArray<FHttpRequestCommon*, TSizedDef
+    0.0%  FTSTicker::Tick(float)
+    0.0%  FSimplyStreamHttpThread::HttpThreadTick(float)
+    0.0%  now
+    0.0%  FSimplyStreamHttpRequest::TickThreadedRequest(float)
+    0.0%  FTaskTagScope::IsRunningDuringStaticInit()
+
+== em-pthread busy 100% of 6.5s
+  100.0%  __pthread_cond_timedwait
+  -- inclusive --
+  100.0%  __pthread_cond_timedwait
+  100.0%  FPThreadEvent::Wait(unsigned int, bool)
+  100.0%  (root)
+
+== em-pthread busy 100% of 6.4s
+  100.0%  __pthread_cond_timedwait
+  -- inclusive --
+  100.0%  __pthread_cond_timedwait
+  100.0%  (root)
+  100.0%  FPThreadEvent::Wait(unsigned int, bool)
+  100.0%  FWndrProbedEvent::Wait(unsigned int, bool)
+    0.0%  _emscripten_run_js_on_main_thread
+    0.0%  js-to-wasm:ilili:d
+    0.0%  (anon)
+    0.0%  proxyToMainThread
+    0.0%  wasm-to-js
+    0.0%  UE::FGenericPlatformIoDispatcher::ProcessFileIo(bool&)
+    0.0%  _fd_seek
+    0.0%  _fd_read
+    0.0%  fread

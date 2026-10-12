@@ -1,0 +1,542 @@
+#include "DawnCommandContext.h"
+#include "DawnDynamicRHI.h"
+#include "DawnResources.h"
+
+FDawnCommandContext::FDawnCommandContext(FDawnDynamicRHI* InOwner)
+	: Owner(InOwner)
+{
+}
+
+FDawnCommandContext::~FDawnCommandContext()
+{
+	if (ActiveRenderPass) { wgpuRenderPassEncoderRelease(ActiveRenderPass); }
+	if (CommandEncoder) { wgpuCommandEncoderRelease(CommandEncoder); }
+}
+
+void FDawnCommandContext::EnsureCommandEncoder()
+{
+	if (!CommandEncoder)
+	{
+		WGPUCommandEncoderDescriptor Desc = {};
+		CommandEncoder = wgpuDeviceCreateCommandEncoder(Owner->GetDevice(), &Desc);
+	}
+}
+
+// ============================================================================
+// REAL: minimum draw path (set pipeline, set vertex buffer, viewport, draw)
+// ============================================================================
+
+void FDawnCommandContext::RHISetStreamSource(uint32 StreamIndex, FRHIBuffer* VertexBuffer, uint32 Offset)
+{
+	// Stage 1: single vertex stream (index 0).
+	BoundVertexBuffer = static_cast<FDawnBuffer*>(VertexBuffer);
+	BoundVertexBufferOffset = Offset;
+}
+
+void FDawnCommandContext::RHISetViewport(float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ)
+{
+	if (ActiveRenderPass)
+	{
+		wgpuRenderPassEncoderSetViewport(ActiveRenderPass, MinX, MinY, MaxX - MinX, MaxY - MinY, MinZ, MaxZ);
+	}
+}
+
+void FDawnCommandContext::RHISetScissorRect(bool bEnable, uint32 MinX, uint32 MinY, uint32 MaxX, uint32 MaxY)
+{
+	if (ActiveRenderPass)
+	{
+		if (bEnable)
+		{
+			wgpuRenderPassEncoderSetScissorRect(ActiveRenderPass, MinX, MinY, MaxX - MinX, MaxY - MinY);
+		}
+		else if (CurrentRTWidth > 0 && CurrentRTHeight > 0)
+		{
+			// Reset to the full render target -- Slate disables the scissor after
+			// clipping an element; leaving a stale small scissor clips everything
+			// after it to a tiny rect (the whole UI collapsed to a corner).
+			wgpuRenderPassEncoderSetScissorRect(ActiveRenderPass, 0, 0, CurrentRTWidth, CurrentRTHeight);
+		}
+	}
+}
+
+void FDawnCommandContext::RHISetGraphicsPipelineState(FRHIGraphicsPipelineState* GraphicsState, uint32 StencilRef, bool bApplyAdditionalState)
+{
+	checkf(ActiveRenderPass, TEXT("DawnRHI Stage 1: RHISetGraphicsPipelineState must be called between RHIBeginRenderPass/RHIEndRenderPass"));
+	FDawnGraphicsPipelineState* PSO = static_cast<FDawnGraphicsPipelineState*>(GraphicsState);
+	wgpuRenderPassEncoderSetPipeline(ActiveRenderPass, PSO->Pipeline);
+	CurrentPSO = PSO;
+	// New shader/PSO: drop the previous draw's accumulated bind-group entries + transient UBs.
+	PendingBindEntries.Reset();
+	for (WGPUBuffer UB : PendingTransientUBs) { wgpuBufferRelease(UB); }
+	PendingTransientUBs.Reset();
+}
+
+void FDawnCommandContext::FlushPendingBindGroups()
+{
+	if (!CurrentPSO || !ActiveRenderPass || CurrentPSO->BindGroupLayouts.Num() == 0) { return; }
+	{
+		static TSet<void*> _seenPSO; static uint32 _pn=0;
+		if (!_seenPSO.Contains((void*)CurrentPSO) && _pn < 80)
+		{
+			_seenPSO.Add((void*)CurrentPSO); _pn++;
+			FString VN, PN;
+			if (CurrentPSO->VertexShader) for (const FDawnShaderBinding& B : CurrentPSO->VertexShader->Bindings) { VN += B.Name; VN += TEXT(","); }
+			if (CurrentPSO->PixelShader)  for (const FDawnShaderBinding& B : CurrentPSO->PixelShader->Bindings)  { PN += B.Name; PN += TEXT(","); }
+			UE_LOG(LogDawnRHI, Warning, TEXT("PSODRAW #%u pres=%d VS[%s] PS[%s]"), _pn, bCurRTPresentable?1:0, *VN, *PN);
+		}
+	}
+	// Build the per-group reflected layout (binding + kind + name) from VS+PS.
+	TMap<uint32, TArray<FDawnShaderBinding>> LayoutByGroup;
+	auto AddLayout = [&](const TArray<FDawnShaderBinding>& Bs)
+	{
+		for (const FDawnShaderBinding& B : Bs)
+		{
+			TArray<FDawnShaderBinding>& L = LayoutByGroup.FindOrAdd(B.Group);
+			bool bDup=false; for (const FDawnShaderBinding& X : L) { if (X.Binding==B.Binding) { bDup=true; break; } }
+			if (!bDup) { L.Add(B); }
+		}
+	};
+	if (CurrentPSO->VertexShader) { AddLayout(CurrentPSO->VertexShader->Bindings); }
+	if (CurrentPSO->PixelShader)  { AddLayout(CurrentPSO->PixelShader->Bindings); }
+	for (const TPair<uint32, TArray<FDawnShaderBinding>>& LG : LayoutByGroup)
+	{
+		const uint32 Group = LG.Key;
+		if (Group >= (uint32)CurrentPSO->BindGroupLayouts.Num()) { continue; }
+		const TMap<uint32, WGPUBindGroupEntry>* Pending = PendingBindEntries.Find(Group);
+		TArray<WGPUBindGroupEntry> Entries;
+		for (const FDawnShaderBinding& B : LG.Value)
+		{
+			if (Pending) { if (const WGPUBindGroupEntry* E = Pending->Find(B.Binding)) { Entries.Add(*E); continue; } }
+			// Static UB (View/SlateView/etc) matched by name for still-empty uniform buffers.
+			if (B.Kind == EDawnShaderBindingKind::UniformBuffer && StaticUBsByName.Num() > 0)
+			{
+				FRHIUniformBuffer* Found = nullptr;
+				for (const TPair<FString, FRHIUniformBuffer*>& P : StaticUBsByName)
+					if (!B.Name.IsEmpty() && B.Name.Equals(P.Key, ESearchCase::CaseSensitive)) { Found = P.Value; break; }
+				if (Found) { FDawnUniformBuffer* DUB = static_cast<FDawnUniformBuffer*>(Found); if (DUB->Buffer) { WGPUBindGroupEntry E={}; E.binding=B.Binding; E.buffer=DUB->Buffer; E.size=DUB->GetLayout().ConstantBufferSize; Entries.Add(E); { const bool _v=B.Name.Contains(TEXT("View"))&&!B.Name.Contains(TEXT("Slate")); static uint32 _si=0; if(_v||_si++<16) UE_LOG(LogDawnRHI, Warning, TEXT("STATICINJECT bind=%u name=%s size=%u"), B.Binding, *B.Name, (uint32)E.size); } continue; } }
+			}
+		}
+		if (Entries.Num() != LG.Value.Num())
+		{
+			static uint32 _bi=0;
+			if (_bi++ < 600)
+			{
+				UE_LOG(LogDawnRHI, Warning, TEXT("BGINCOMPLETE grp=%u have=%d need=%d staticUB=%d"), Group, Entries.Num(), LG.Value.Num(), StaticUBsByName.Num());
+				for (const FDawnShaderBinding& B : LG.Value)
+				{
+					bool bHave = (Pending && Pending->Find(B.Binding));
+					UE_LOG(LogDawnRHI, Warning, TEXT("   BGImiss bind=%u kind=%d name=%s filled=%d"), B.Binding, (int)B.Kind, *B.Name, bHave?1:0);
+				}
+			}
+			continue;
+		}
+		WGPUBindGroupDescriptor BgDesc = {};
+		BgDesc.layout = CurrentPSO->BindGroupLayouts[Group];
+		BgDesc.entryCount = Entries.Num();
+		BgDesc.entries = Entries.GetData();
+		WGPUBindGroup BindGroup = wgpuDeviceCreateBindGroup(Owner->GetDevice(), &BgDesc);
+		if (BindGroup) { wgpuRenderPassEncoderSetBindGroup(ActiveRenderPass, Group, BindGroup, 0, nullptr); wgpuBindGroupRelease(BindGroup); }
+	}
+}
+
+void FDawnCommandContext::RHIDrawPrimitive(uint32 BaseVertexIndex, uint32 NumPrimitives, uint32 NumInstances)
+{
+	checkf(ActiveRenderPass, TEXT("DawnRHI Stage 1: RHIDrawPrimitive requires an active render pass"));
+	FlushPendingBindGroups();
+	if (BoundVertexBuffer)
+	{
+		wgpuRenderPassEncoderSetVertexBuffer(ActiveRenderPass, 0, BoundVertexBuffer->Buffer, BoundVertexBufferOffset, WGPU_WHOLE_SIZE);
+	}
+	// Stage 1 only wires up triangle lists (matches FGraphicsPipelineStateInitializer::PrimitiveType == PT_TriangleList).
+	const uint32 VertexCount = NumPrimitives * 3;
+	wgpuRenderPassEncoderDraw(ActiveRenderPass, VertexCount, NumInstances, BaseVertexIndex, 0);
+}
+
+void FDawnCommandContext::RHIBeginRenderPass(const FRHIRenderPassInfo& InInfo, const TCHAR* InName)
+{
+	EnsureCommandEncoder();
+
+	FDawnTexture* ColorTex = static_cast<FDawnTexture*>(InInfo.ColorRenderTargets[0].RenderTarget);
+	if (ColorTex) { CurrentRTWidth = (uint32)ColorTex->GetDesc().Extent.X; CurrentRTHeight = (uint32)ColorTex->GetDesc().Extent.Y; }
+	bCurRTPresentable = ColorTex && EnumHasAnyFlags(ColorTex->GetDesc().Flags, ETextureCreateFlags::Presentable);
+	{ static uint32 _rp=0; if((_rp++%120)==0) UE_LOG(LogTemp, Warning, TEXT("RTDIAG: render target %ux%u"), CurrentRTWidth, CurrentRTHeight); }
+	if (ColorTex) { const bool bPresentable = EnumHasAnyFlags(ColorTex->GetDesc().Flags, ETextureCreateFlags::Presentable); static uint32 _bt=0; static uint32 _pres=0; if (bPresentable) { if(_pres++<8) UE_LOG(LogTemp, Warning, TEXT("RPTGT-BACKBUFFER %ux%u tex=%p (pass=%u)"), CurrentRTWidth, CurrentRTHeight, (void*)ColorTex->Texture, _bt); } else if ((_bt%400)==0) { UE_LOG(LogTemp, Warning, TEXT("RPTGT-intermediate %ux%u tex=%p"), CurrentRTWidth, CurrentRTHeight, (void*)ColorTex->Texture); } _bt++; }
+	checkf(ColorTex && ColorTex->View, TEXT("DawnRHI Stage 1: RHIBeginRenderPass requires ColorRenderTargets[0]"));
+
+	WGPURenderPassColorAttachment ColorAttach = {};
+	ColorAttach.view = ColorTex->RTView ? ColorTex->RTView : ColorTex->View;
+	// Honour the render pass's real load action. Slate composites the UI in MANY passes
+	// (first clears, the rest LOAD to preserve prior batches); the old always-Clear
+	// erased every previous pass -> only the final pass survived -> black screen.
+	const ERenderTargetLoadAction ColorLoadAction = GetLoadAction(InInfo.ColorRenderTargets[0].Action);
+	ColorAttach.loadOp = (ColorLoadAction == ERenderTargetLoadAction::ELoad) ? WGPULoadOp_Load : WGPULoadOp_Clear;
+	ColorAttach.storeOp = WGPUStoreOp_Store;
+	ColorAttach.clearValue = { 0.0, 0.0, 0.0, 1.0 };
+	ColorAttach.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+
+	WGPURenderPassDescriptor RpDesc = {};
+	RpDesc.colorAttachmentCount = 1;
+	RpDesc.colorAttachments = &ColorAttach;
+
+	WGPURenderPassDepthStencilAttachment DepthAttach = {};
+	FDawnTexture* DepthTex = static_cast<FDawnTexture*>(InInfo.DepthStencilRenderTarget.DepthStencilTarget);
+	if (DepthTex && DepthTex->View)
+	{
+		DepthAttach.view = DepthTex->RTView ? DepthTex->RTView : DepthTex->View;
+		DepthAttach.depthLoadOp = WGPULoadOp_Clear;
+		DepthAttach.depthStoreOp = WGPUStoreOp_Store;
+		DepthAttach.depthClearValue = 1.0f;
+		DepthAttach.depthReadOnly = false;
+		RpDesc.depthStencilAttachment = &DepthAttach;
+	}
+
+	ActiveRenderPass = wgpuCommandEncoderBeginRenderPass(CommandEncoder, &RpDesc);
+}
+
+void FDawnCommandContext::RHIEndRenderPass()
+{
+	checkf(ActiveRenderPass, TEXT("DawnRHI: RHIEndRenderPass without a matching RHIBeginRenderPass"));
+	wgpuRenderPassEncoderEnd(ActiveRenderPass);
+	wgpuRenderPassEncoderRelease(ActiveRenderPass);
+	ActiveRenderPass = nullptr;
+}
+
+void FDawnCommandContext::SubmitToQueue()
+{
+	if (CommandEncoder)
+	{
+		WGPUCommandBufferDescriptor CbDesc = {};
+		WGPUCommandBuffer CmdBuf = wgpuCommandEncoderFinish(CommandEncoder, &CbDesc);
+		wgpuQueueSubmit(Owner->GetQueue(), 1, &CmdBuf);
+		wgpuCommandBufferRelease(CmdBuf);
+		wgpuCommandEncoderRelease(CommandEncoder);
+		CommandEncoder = nullptr;
+	}
+}
+
+// ============================================================================
+// Stub bodies (checkNoEntry) for everything a bare triangle never hits —
+// compute, transitions/barriers, UAVs, breadcrumbs, indexed/indirect draws,
+// depth-bounds, texture copy, legacy bound-shader-state path.
+// ============================================================================
+
+void FDawnCommandContext::RHISetComputePipelineState(FRHIComputePipelineState* ComputePipelineState)
+{
+	// no-op: DawnRHI runs no compute (mobile compute shaders don't cross-compile to WGSL); the pass is skipped.
+}
+
+void FDawnCommandContext::RHIDispatchComputeShader(uint32 ThreadGroupCountX, uint32 ThreadGroupCountY, uint32 ThreadGroupCountZ)
+{
+	// no-op: DawnRHI runs no compute; the dispatch is skipped (its output buffers keep their prior/cleared contents).
+}
+
+void FDawnCommandContext::RHIDispatchIndirectComputeShader(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset)
+{
+	// no-op: DawnRHI runs no compute; indirect dispatch skipped.
+}
+
+void FDawnCommandContext::RHIBeginTransitions(TArrayView<const FRHITransition*> Transitions)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+
+void FDawnCommandContext::RHIEndTransitions(TArrayView<const FRHITransition*> Transitions)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+
+void FDawnCommandContext::RHIClearUAVFloat(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FVector4f& Values)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+
+void FDawnCommandContext::RHIClearUAVUint(FRHIUnorderedAccessView* UnorderedAccessViewRHI, const FUintVector4& Values)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+
+void FDawnCommandContext::RHISetShaderParameters(FRHIComputeShader* ComputeShader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters)
+{
+	// no-op: DawnRHI runs no compute; compute shader parameters are ignored.
+}
+
+// Derive the shader-side uniform-buffer name from the layout debug name:
+// FViewUniformShaderParameters -> View, FMobileBasePassUniformParameters ->
+// MobileBasePass, FSlateViewUniformParameters -> SlateView. This is the name
+// the cooked WGSL var carries (see the bridge's WNDR rename pass), so the
+// draw-time static-UB match can bind it exactly.
+static FString DawnDeriveShaderUBName(const FString& DebugName)
+{
+	FString N = DebugName;
+	if (N.Len() > 1 && N[0] == TEXT('F') && FChar::IsUpper(N[1])) { N.RightChopInline(1); }
+	static const TCHAR* const Suffixes[] = { TEXT("UniformShaderParameters"), TEXT("UniformParameters"), TEXT("ShaderParameters"), TEXT("Parameters") };
+	for (const TCHAR* Sfx : Suffixes) { if (N.EndsWith(Sfx, ESearchCase::CaseSensitive)) { N.LeftChopInline(FCString::Strlen(Sfx)); break; } }
+	return N;
+}
+
+void FDawnCommandContext::RHISetStaticUniformBuffers(const FUniformBufferStaticBindings& InUniformBuffers)
+{
+	for (int32 i = 0; i < InUniformBuffers.GetUniformBufferCount(); ++i)
+	{
+		if (FRHIUniformBuffer* UB = InUniformBuffers.GetUniformBuffer(i))
+		{
+			StaticUBsByName.Add(UB->GetLayout().GetDebugName(), UB);
+			{ const FString DKey = DawnDeriveShaderUBName(UB->GetLayout().GetDebugName()); if (!DKey.IsEmpty()) StaticUBsByName.Add(DKey, UB); }
+			{ const FString _n=UB->GetLayout().GetDebugName(); const bool _v=_n.Contains(TEXT("View"))&&!_n.Contains(TEXT("Slate")); static uint32 _su=0; if(_v||_su++<8) UE_LOG(LogTemp, Warning, TEXT("STATICUB set name=%s size=%u"), *_n, UB->GetLayout().ConstantBufferSize); }
+		}
+	}
+}
+
+void FDawnCommandContext::RHISetStaticUniformBuffer(FUniformBufferStaticSlot Slot, FRHIUniformBuffer* UniformBuffer)
+{
+	if (UniformBuffer)
+	{
+		StaticUBsByName.Add(UniformBuffer->GetLayout().GetDebugName(), UniformBuffer);
+		{ const FString DKey = DawnDeriveShaderUBName(UniformBuffer->GetLayout().GetDebugName()); if (!DKey.IsEmpty()) StaticUBsByName.Add(DKey, UniformBuffer); }
+	}
+}
+
+#if WITH_RHI_BREADCRUMBS
+void FDawnCommandContext::RHIBeginBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+
+void FDawnCommandContext::RHIEndBreadcrumbGPU(FRHIBreadcrumbNode* Breadcrumb)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+#endif
+
+void FDawnCommandContext::RHISetMultipleViewports(uint32 Count, const FViewportBounds* Data)
+{
+	checkNoEntry();
+}
+
+void FDawnCommandContext::RHIBeginRenderQuery(FRHIRenderQuery* RenderQuery)
+{
+	checkNoEntry();
+}
+
+void FDawnCommandContext::RHIEndRenderQuery(FRHIRenderQuery* RenderQuery)
+{
+	checkNoEntry();
+}
+
+void FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader* Shader, TConstArrayView<uint8> InParametersData, TConstArrayView<FRHIShaderParameter> InParameters, TConstArrayView<FRHIShaderParameterResource> InResourceParameters, TConstArrayView<FRHIShaderParameterResource> InBindlessParameters)
+{
+	// Stage 2 fallback / multi-@group fix (this session): when the bound PSO
+	// carries real reflection data (FDawnVertexShader/FDawnPixelShader::
+	// Bindings — see DawnResources.h/RHICreateGraphicsPipelineState in
+	// DawnDynamicRHI.cpp), each FRHIShaderParameterResource::Index is a real
+	// flattened WGSL @binding number, but NOT necessarily @group(0) — a
+	// caller (like DawnRHITestMain's real-shader render path) can pass
+	// resources belonging to more than one real @group in a single call, so
+	// this now looks up each resource's real Group by its Binding number
+	// (scanning the bound VS+PS's reflected ::Bindings — flattened binding
+	// numbers are unique across a whole cooked shader, see HANDOFF.md
+	// "Update 12", so this is unambiguous) and issues one
+	// wgpuRenderPassEncoderSetBindGroup call per real group actually
+	// touched, against CurrentPSO->BindGroupLayouts[Group] (one layout per
+	// group — see the NOTE in DawnResources.h). Falls back to the old
+	// single-@group(0) behaviour (trusting Param.Index directly, no lookup)
+	// when the PSO has no reflection data at all, matching the Stage 1/2
+	// hand-authored WGSL paths' fixed convention.
+	checkf(CurrentPSO && CurrentPSO->BindGroupLayouts.Num() > 0, TEXT("DawnRHI: RHISetShaderParameters requires RHISetGraphicsPipelineState to have run first"));
+	if (InResourceParameters.Num() == 0 && InParametersData.Num() == 0)
+	{
+		return;
+	}
+	// Route each stage's resources to its OWN bind group: VS->group 0, PS->group 1
+	// (the PS WGSL was remapped to @group(1) at create time). This stops the PS
+	// bind-group from overwriting the VS's at @group(0) and losing the transform.
+	[[maybe_unused]] const uint32 StageGroup = (Shader->GetFrequency() == SF_Pixel) ? 1u : 0u;
+	{ static uint32 _e=0; if(_e++<80){ UE_LOG(LogTemp, Warning, TEXT("SPFULL freq=%d res=%d params=%d pdata=%d"), (int)Shader->GetFrequency(), InResourceParameters.Num(), InParameters.Num(), InParametersData.Num()); for(const FRHIShaderParameterResource& R:InResourceParameters){ UE_LOG(LogTemp, Warning, TEXT("   SPFULLres idx=%u type=%d"), R.Index, (int)R.Type); } } }
+
+	[[maybe_unused]] auto FindGroupForBinding = [this](uint32 Binding) -> uint32
+	{
+		for (const FDawnShaderBinding& B : CurrentPSO->VertexShader->Bindings)
+		{
+			if (B.Binding == Binding) { return B.Group; }
+		}
+		for (const FDawnShaderBinding& B : CurrentPSO->PixelShader->Bindings)
+		{
+			if (B.Binding == Binding) { return B.Group; }
+		}
+		return 0; // no reflection data (or an unreflected binding) -- Stage 2 fixed convention is always @group(0)
+	};
+
+	TMap<uint32, TArray<WGPUBindGroupEntry>> EntriesByGroup;
+	for (const FRHIShaderParameterResource& Param : InResourceParameters)
+	{
+		// WNDR: a material draw can pass a NULL resource (a texture/SRV param that
+		// falls back to a null default, e.g. materials whose HLSL-stage translation
+		// failed and use the default material). Dereferencing it via the static_cast
+		// below is an OOB crash. Skip it -> that binding stays unfilled (BGINCOMPLETE
+		// drops the group harmlessly) instead of crashing the whole render.
+		if (Param.Resource == nullptr) { static uint32 _nr=0; if(_nr++<24) UE_LOG(LogDawnRHI, Warning, TEXT("SPNULLRES idx=%u type=%d SKIP"), Param.Index, (int)Param.Type); continue; }
+		WGPUBindGroupEntry Entry = {};
+		Entry.binding = Param.Index;
+		switch (Param.Type)
+		{
+		case FRHIShaderParameterResource::EType::UniformBuffer:
+		{
+			FDawnUniformBuffer* UB = static_cast<FDawnUniformBuffer*>(Param.Resource);
+			Entry.buffer = UB->Buffer;
+			Entry.size = UB->GetLayout().ConstantBufferSize;
+			break;
+		}
+		case FRHIShaderParameterResource::EType::Texture:
+		{
+			FDawnTexture* Tex = static_cast<FDawnTexture*>(Param.Resource);
+			Entry.textureView = Tex->View;
+			{ static uint32 _tc=0; if(_tc++<24){ const FRHITextureDesc& D=Tex->GetDesc(); UE_LOG(LogDawnRHI, Warning, TEXT("TEXBIND bind=%u fmt=%d %ux%u mips=%u view=%d"), Param.Index, (int)D.Format, D.Extent.X, D.Extent.Y, D.NumMips, Tex->View?1:0); } }
+			if (Tex->GetDesc().Format == PF_A8 && CurrentPSO && CurrentPSO->PixelShader) { static bool _dumped=false; if(!_dumped){ _dumped=true; const FString& W=CurrentPSO->PixelShader->WGSLSource; int32 from=0; int32 n=0; while(n<8){ int32 idx=W.Find(TEXT("textureSample"), ESearchCase::CaseSensitive, ESearchDir::FromStart, from); if(idx==INDEX_NONE) break; UE_LOG(LogDawnRHI, Warning, TEXT("WGSLSAMP[%d]: %s"), n, *W.Mid(idx, 180)); from=idx+13; ++n; } int32 ri=W.Find(TEXT("return"), ESearchCase::CaseSensitive, ESearchDir::FromEnd); if(ri!=INDEX_NONE){ UE_LOG(LogDawnRHI, Warning, TEXT("WGSLRET: %s"), *W.Mid(ri, 160)); } UE_LOG(LogDawnRHI, Warning, TEXT("WGSLLEN=%d"), W.Len()); } }
+			break;
+		}
+		case FRHIShaderParameterResource::EType::Sampler:
+		{
+			FDawnSamplerState* Sampler = static_cast<FDawnSamplerState*>(Param.Resource);
+			Entry.sampler = Sampler->Sampler;
+			break;
+		}
+		case FRHIShaderParameterResource::EType::ResourceView:
+		{
+			FDawnShaderResourceView* SRV = static_cast<FDawnShaderResourceView*>(Param.Resource);
+			{ static uint32 _sc=0; if(_sc++<24) UE_LOG(LogDawnRHI, Warning, TEXT("SRVBIND bind=%u texview=%d buf=%d"), Param.Index, SRV->TextureView?1:0, SRV->Buffer?1:0); }
+			if (SRV->TextureView)
+			{
+				Entry.textureView = SRV->TextureView;
+			}
+			else
+			{
+				Entry.buffer = SRV->Buffer;
+				Entry.size = SRV->BufferSize;
+			}
+			break;
+		}
+		case FRHIShaderParameterResource::EType::UnorderedAccessView:
+		{
+			FDawnUnorderedAccessView* UAV = static_cast<FDawnUnorderedAccessView*>(Param.Resource);
+			if (UAV->TextureView)
+			{
+				Entry.textureView = UAV->TextureView;
+			}
+			else
+			{
+				Entry.buffer = UAV->Buffer;
+				Entry.size = UAV->BufferSize;
+			}
+			break;
+		}
+		default:
+			checkf(false, TEXT("DawnRHI Stage 2: unsupported shader parameter resource type %d"), (int32)Param.Type);
+			continue;
+		}
+		const uint32 Group = FindGroupForBinding(Param.Index);
+		EntriesByGroup.FindOrAdd(Group).Add(Entry);
+	}
+
+	// Loose global parameters ($Globals): UE passes the packed global-constant bytes as
+	// InParametersData, with a per-member layout in InParameters (BufferIndex = the target
+	// uniform-buffer @binding, ByteOffset = source offset in InParametersData, BaseIndex =
+	// destination offset within the CB, ByteSize = size). Pack each BufferIndex into a
+	// transient uniform buffer and bind it -- without this the shader's $Globals CB binding
+	// is never provided, Dawn rejects the whole bind group ("Number of entries did not
+	// match"), and (even if it didn't) the vertex transform / draw constants are missing.
+	TArray<WGPUBuffer> TransientUBs;
+	if (InParametersData.Num() > 0 && InParameters.Num() > 0)
+	{
+		TMap<uint16, uint32> BufSizes;
+		for (const FRHIShaderParameter& P : InParameters)
+		{
+			uint32& Sz = BufSizes.FindOrAdd(P.BufferIndex);
+			Sz = FMath::Max(Sz, (uint32)P.BaseIndex + (uint32)P.ByteSize);
+		}
+		for (const TPair<uint16, uint32>& BS : BufSizes)
+		{
+			// Over-allocate: UE reports only the members it set, but the shaders WGSL
+			// uniform-buffer struct is padded larger (e.g. 48 used -> 64 required). A larger
+			// buffer satisfies WebGPUs minBindingSize; the tail is zero-filled.
+			const uint32 CbSize = Align(BS.Value + 256u, 16u);
+			TArray<uint8> Cpu;
+			Cpu.SetNumZeroed(CbSize);
+			for (const FRHIShaderParameter& P : InParameters)
+			{
+				if (P.BufferIndex != BS.Key) { continue; }
+				if ((uint32)P.ByteOffset + P.ByteSize <= (uint32)InParametersData.Num() && (uint32)P.BaseIndex + P.ByteSize <= CbSize)
+				{
+					FMemory::Memcpy(Cpu.GetData() + P.BaseIndex, InParametersData.GetData() + P.ByteOffset, P.ByteSize);
+				}
+			}
+			{ static uint32 _g=0; if(_g++<2 && CbSize>=64){ const float* F=(const float*)Cpu.GetData(); const int N=(int)(CbSize/4); for(int r=0;r<N && r<20;r+=4){ UE_LOG(LogTemp, Warning, TEXT("GLOBALSDIAG bind=%u fl%d [%.4f %.4f %.4f %.4f]"), (uint32)BS.Key, r, F[r],F[r+1],F[r+2],F[r+3]); } } }
+			WGPUBufferDescriptor BD = {};
+			BD.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+			BD.size = CbSize;
+			WGPUBuffer UB = wgpuDeviceCreateBuffer(Owner->GetDevice(), &BD);
+			wgpuQueueWriteBuffer(Owner->GetQueue(), UB, 0, Cpu.GetData(), CbSize);
+			TransientUBs.Add(UB);
+			WGPUBindGroupEntry E = {};
+			E.binding = BS.Key;
+			E.buffer = UB;
+			E.size = CbSize;
+			EntriesByGroup.FindOrAdd(FindGroupForBinding(BS.Key)).Add(E);
+		}
+	}
+
+	// Accumulate this call's entries into the pending set (keyed by binding so a later
+	// stage's call extends rather than replaces). The bind group is created at DRAW time in
+	// FlushPendingBindGroups() from ALL the accumulated VS+PS calls.
+	for (const TPair<uint32, TArray<WGPUBindGroupEntry>>& Pair : EntriesByGroup)
+	{
+		TMap<uint32, WGPUBindGroupEntry>& Dst = PendingBindEntries.FindOrAdd(Pair.Key);
+		for (const WGPUBindGroupEntry& E : Pair.Value) { Dst.Add(E.binding, E); }
+	}
+	for (WGPUBuffer UB : TransientUBs) { PendingTransientUBs.Add(UB); }
+}
+
+void FDawnCommandContext::RHIDrawPrimitiveIndirect(FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset)
+{
+	checkNoEntry();
+}
+
+void FDawnCommandContext::RHIDrawIndexedPrimitive(FRHIBuffer* IndexBufferRHI, int32 BaseVertexIndex, uint32 FirstInstance, uint32 NumVertices, uint32 StartIndex, uint32 NumPrimitives, uint32 NumInstances)
+{
+	FlushPendingBindGroups();
+	{ static uint32 dP=0,dI=0; if(bCurRTPresentable) dP++; else dI++; if(((dP+dI)%3000)==0) UE_LOG(LogTemp, Warning, TEXT("DRAWTGT backbuffer-draws=%u intermediate-draws=%u"), dP, dI); }
+	checkf(ActiveRenderPass, TEXT("DawnRHI: RHIDrawIndexedPrimitive requires an active render pass"));
+	if (BoundVertexBuffer)
+	{
+		wgpuRenderPassEncoderSetVertexBuffer(ActiveRenderPass, 0, BoundVertexBuffer->Buffer, BoundVertexBufferOffset, WGPU_WHOLE_SIZE);
+	}
+	FDawnBuffer* IndexBuffer = static_cast<FDawnBuffer*>(IndexBufferRHI);
+	const WGPUIndexFormat IndexFormat = (IndexBuffer->GetStride() == 2) ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
+	wgpuRenderPassEncoderSetIndexBuffer(ActiveRenderPass, IndexBuffer->Buffer, IndexFormat, 0, WGPU_WHOLE_SIZE);
+	// Stage: triangle lists (matches PT_TriangleList) — 3 indices per primitive.
+	const uint32 IndexCount = NumPrimitives * 3;
+	wgpuRenderPassEncoderDrawIndexed(ActiveRenderPass, IndexCount, FMath::Max<uint32>(NumInstances, 1), StartIndex, BaseVertexIndex, FirstInstance);
+}
+
+void FDawnCommandContext::RHIDrawIndexedPrimitiveIndirect(FRHIBuffer* IndexBuffer, FRHIBuffer* ArgumentBuffer, uint32 ArgumentOffset)
+{
+	checkNoEntry();
+}
+
+void FDawnCommandContext::RHISetDepthBounds(float MinDepth, float MaxDepth)
+{
+	// no-op (WebGPU manages barriers automatically; others are non-essential to the UI render path)
+}
+
+void FDawnCommandContext::RHICopyTexture(FRHITexture* SourceTexture, FRHITexture* DestTexture, const FRHICopyTextureInfo& CopyInfo)
+{
+	checkNoEntry();
+}
+
+void FDawnCommandContext::RHICopyBufferRegion(FRHIBuffer* DestBuffer, uint64 DstOffset, FRHIBuffer* SourceBuffer, uint64 SrcOffset, uint64 NumBytes)
+{
+	checkNoEntry();
+}
+
+// RHISetBoundShaderState / RHISetDepthStencilState / RHISetRasterizerState /
+// RHISetBlendState / RHIEnableDepthBoundsTest / RHISetComputeShader removed —
+// see the note in DawnCommandContext.h (they belong to IRHICommandContextPSOFallback).

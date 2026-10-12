@@ -1,0 +1,23 @@
+{
+  "FileVersion" : 3,
+	
+	"FriendlyName" : "Basis Texture",
+	"Version" : 1,
+	"VersionName" : "1.0",
+	"CreatedBy": "Wonder Interactive, Inc.",
+	"CreatedByURL": "http://epicgames.com",
+	"Description" : "Basis Texture plugin",
+    "Category": "Compression",
+	"EnabledByDefault" : true,
+	"CanContainContent" : false,
+	"IsBetaVersion" : false,
+	"Installed" : false,
+
+  "Modules": [
+	{
+		"Name": "TextureFormatBasis",
+		"Type": "UncookedOnly",
+		"LoadingPhase": "PostEngineInit"
+	}
+  ]
+}

@@ -1,0 +1,64 @@
+threads: 33 2026-10-12T19:04:23.518Z
+profiling 22
+
+== em-pthread busy 99% of 26.0s
+   14.0%  FDawnCommandContext::FlushPendingBindGroups()
+   11.1%  FDawnCommandContext::FlushPendingBindGroups()::$_1::operator()(FRHIUniformBuffer*) const
+    7.3%  __wrap_memcpy
+    4.1%  DawnDeriveShaderUBName(FString const&)
+    4.0%  FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader*, TArrayView<unsigned char const, int>, TArrayV
+    2.5%  _emscripten_get_now
+    2.3%  bigintToI53Checked
+    1.8%  emscripten_builtin_malloc
+    1.6%  createBindGroup
+    1.5%  (garbage collector)
+    1.3%  emscripten_builtin_free
+    1.3%  memcmp
+    1.2%  .L__unnamed_58
+    1.2%  FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader*, TArrayView<unsigned char const, int>, TArrayV
+  -- inclusive --
+  100.0%  (root)
+   96.0%  js-to-wasm:l:l
+   96.0%  Module.channel.port1.onmessage
+   96.0%  SIMPLYSTREAM_Tick
+   95.9%  FEngineLoop::Tick()
+   94.1%  UGameEngine::Tick(float, bool)
+   94.1%  UUTGameEngine::Tick(float, bool)
+   86.2%  FViewport::Draw(bool)
+   86.2%  UEngine::RedrawViewports(bool)
+   86.1%  UUTGameViewportClient::Draw(FViewport*, FCanvas*)
+   85.9%  UGameViewportClient::Draw(FViewport*, FCanvas*)
+   83.7%  FRendererModule::BeginRenderingViewFamilies(FCanvas*, TArrayView<FSceneViewFamily* const, int>)
+   83.7%  FRendererModule::BeginRenderingViewFamily(FCanvas*, FSceneViewFamily*)
+   83.0%  FSceneRenderProcessor::Execute()
+   82.9%  UE::Core::Private::Function::TFunctionRefCaller<FSceneRenderProcessor::Execute()::$_3, void, FRHICommandListImmediate&>:
+   75.8%  FRDGBuilder::Execute()
+   71.1%  FParallelMeshDrawCommandPass::Draw(FRHICommandList&, FInstanceCullingDrawParams const*) const
+   71.1%  SubmitMeshDrawCommandsRange(TArray<FVisibleMeshDrawCommand, TLinearArrayAllocatorBase<FSceneRenderingBlockAllocationTag,
+   64.4%  TRDGLambdaPass<FMobileRenderPassParameters, FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder&, FMobileRenderPass
+   64.4%  FMobileSceneRenderer::RenderMobileBasePass(FRHICommandList&, FViewInfo const&, FInstanceCullingDrawParams const*, FInsta
+   50.4%  FRHICommandList::DrawIndexedPrimitive(FRHIBuffer*, int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned
+   50.4%  FDawnCommandContext::RHIDrawIndexedPrimitive(FRHIBuffer*, int, unsigned int, unsigned int, unsigned int, unsigned int, u
+   48.7%  FMeshDrawCommand::SubmitDrawEnd(FMeshDrawCommand const&, FMeshDrawCommandSceneArgs const&, unsigned int, FRHICommandList
+   45.3%  FDawnCommandContext::FlushPendingBindGroups()
+   41.8%  non-virtual thunk to UUTGameViewportClient::Draw(FViewport*, FCanvas*)
+   22.4%  FMeshDrawCommand::SubmitDrawBegin(FMeshDrawCommand const&, Experimental::TRobinHoodHashSet<FGraphicsMinimalPipelineState
+   20.2%  FRHICommandList::SetBatchedShaderParameters(FRHIGraphicsShader*, FRHIBatchedShaderParameters&)
+   19.9%  FDawnCommandContext::RHISetShaderParameters(FRHIGraphicsShader*, TArrayView<unsigned char const, int>, TArrayView<FRHISh
+   14.4%  wasm-to-js
+   11.2%  FDawnCommandContext::FlushPendingBindGroups()::$_1::operator()(FRHIUniformBuffer*) const
+    9.6%  UE::Tasks::Private::FTaskBase::TryExecuteTask()
+    8.8%  FTaskGraphCompatibilityImplementation::ProcessThreadUntilIdle(ENamedThreads::Type)
+    8.8%  FNamedTaskThread::ProcessTasksNamedThread(int, bool)
+    8.3%  FRendererModule::BeginRenderingViewFamilies(FCanvas*, TArrayView<FSceneViewFamily* const, int>)::$_3::__invoke(FRDGBuild
+    8.3%  FMobileSceneRenderer::Render(FRDGBuilder&, FSceneRenderUpdateInputs const*)
+    7.4%  UWorld::Tick(ELevelTick, float)
+    7.3%  __wrap_memcpy
+    6.9%  FTickTaskManager::RunTickGroup(ETickingGroup, bool)
+    6.9%  UWorld::RunTickGroup(ETickingGroup, bool)
+    6.9%  FTickTaskSequencer::ReleaseTickGroup(ETickingGroup, bool, TArray<FTickFunction*, TSizedDefaultAllocator<32>>&)
+    6.9%  FTaskGraphCompatibilityImplementation::ProcessUntilTasksComplete(TArray<TRefCountPtr<FBaseGraphTask>, TSizedInlineAlloca
+    6.8%  DawnDeriveShaderUBName(FString const&)
+    6.8%  TGraphTask<FTickFunctionTask>::ExecuteTask()
+    6.7%  TRDGLambdaPass<FMobileRenderPassParameters, FMobileSceneRenderer::RenderForwardMultiPass(FRDGBuilder&, FMobileRenderPass
+    6.6%  FMobileSceneRenderer::RenderTranslucency(FRHICommandList&, FViewInfo const&, TArrayView<FViewInfo, int>, ETranslucencyPa

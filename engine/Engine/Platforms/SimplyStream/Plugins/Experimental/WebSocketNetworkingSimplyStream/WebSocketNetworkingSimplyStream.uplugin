@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "WebSocket Networking (SimplyStream)",
+	"Description": "SimplyStream-owned WebSocket net driver. Client uses the emscripten BSD-socket path; the dedicated server bridges to the Node 'ws' server (init_wss/connCB/recvCB/ws_send). Replaces the engine WebSocketNetworking plugin for SimplyStream targets only.",
+	"Category": "Networking",
+	"CreatedBy": "SimplyStream",
+	"CreatedByURL": "https://simplystream.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "WebSocketNetworkingSimplyStream",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"SimplyStream"
+			]
+		}
+	]
+}

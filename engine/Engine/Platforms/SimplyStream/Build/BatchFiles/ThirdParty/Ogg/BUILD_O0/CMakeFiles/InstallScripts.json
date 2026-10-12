@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

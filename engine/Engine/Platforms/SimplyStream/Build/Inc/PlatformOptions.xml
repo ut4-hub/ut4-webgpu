@@ -1,0 +1,8 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../Schema.xsd" >
+
+	<Option Name="WithSimplyStream" Restrict="true|false" DefaultValue="false" Description="Include the SimplyStream target platform"/>
+
+    <Expand Name="AddPlatform" Platform="SimplyStream" IsConsole="false" IsEnabled="$(WithSimplyStream)"/>
+
+</BuildGraph>

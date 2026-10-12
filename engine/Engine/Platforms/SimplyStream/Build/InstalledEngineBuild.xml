@@ -1,0 +1,111 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../../Engine/Build/Graph/Schema.xsd" >
+
+	<Option Name="WithSimplyStream" Restrict="true|false" DefaultValue="false" Description="Include the SimplyStream target platform"/>
+
+	<Property Name="ExtensionPlatforms" Value="$(ExtensionPlatforms);" If="'$(ExtensionPlatforms)' != ''"/>
+	<Property Name="ExtensionPlatforms" Value="$(ExtensionPlatforms)SimplyStream"/>
+	<Property Name="SimplyStreamArchitectures" Value="wasm32+wasm64"/>
+
+	<Do If="$(WithSimplyStream)">
+		<Expand Name="AddExtensionPlatform" PlatformDir="SimplyStream"/>
+	</Do>
+
+	<Extend Name="Platform_FilterOverrides">
+		<Do If="$(WithSimplyStream)">
+			<!-- Update CopyEditorEngineOrPlatformFilter, AutomationToolPaths, etc -->
+			<Property Name="AutomationToolPaths">
+				$(AutomationToolPaths)
+				Engine/Platforms/SimplyStream/Source/Programs/AutomationTool/...
+			</Property>
+		</Do>
+	</Extend>
+	<Extend Name="Platform_Agent_Target_Win64_Licensee">
+		<Agent Name="Target SimplyStream" Type="Win64_Licensee">
+			<Node Name="Compile UnrealGame SimplyStream" Requires="Update Version Files" Produces="#UnrealGame SimplyStream;#UnrealGame SimplyStream Unstripped;#UnrealGame SimplyStream Stripped;#UnrealGame SimplyStream Unsigned;#UnrealGame SimplyStream Signed">
+				<ForEach Name="Configuration" Values="$(GameConfigurations)">
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Tag="#UnrealGame SimplyStream" Arguments="-precompile -allmodules -nolink -architecture=wasm $(TargetDebugInfoArg) $(ExtraCompileArgs)"/>
+					<!--
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Tag="#UnrealGame SimplyStream" Arguments="-precompile -architecture=wasm $(TargetDebugInfoArg) $(ExtraCompileArgs)" Clean="false"/>
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Runtime/HairStrands/HairStrands.uplugin&quot; -architecture=wasm"/>
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Animation/RigLogic/RigLogic.uplugin&quot; -architecture=wasm"/>
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Media/MediaFrameworkUtilities/MediaFrameworkUtilities.uplugin&quot; -architecture=wasm"/>
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Media/MediaIOFramework/MediaIOFramework.uplugin&quot; -architecture=wasm"/>
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/Compositing/OpenColorIO/OpenColorIO.uplugin&quot; -architecture=wasm"/>
+					<Compile Target="UnrealGame" Platform="SimplyStream" Configuration="$(Configuration)" Arguments="-Plugin=&quot;$(RootDir)/Engine/Plugins/MovieScene/MovieRenderPipeline/MovieRenderPipeline.uplugin&quot; -architecture=wasm"/>
+					-->
+				</ForEach>
+
+				<Switch>
+					<Case If="'$(WithFullDebugInfo)' == true">
+						<!-- Copy files for local debug builds -->
+						<Copy Files="#UnrealGame SimplyStream Unstripped" From="$(RootDir)" To="$(SavedOutput)"/>
+					</Case>
+					<Default>
+						<!-- Otherwise, strip the files for distribution -->
+						<Strip BaseDir="$(RootDir)" OutputDir="$(SavedOutput)" Platform="Win64" Files="#UnrealGame SimplyStream Unstripped" Tag="#UnrealGame SimplyStream Stripped"/>
+					</Default>
+				</Switch>
+
+				<Do If="'$(SignExecutables)' == true">
+					<Tag Files="#UnrealGame SimplyStream" Filter="$(WindowsSignFilter)" With="#UnrealGame SimplyStream Unsigned"/>
+					<Copy Files="#UnrealGame SimplyStream Unsigned" From="$(RootDir)" To="$(SavedOutput)" Tag="#Game_ToSign_SimplyStream"/>
+					<Sign Files="#Game_ToSign_SimplyStream" Tag="#UnrealGame SimplyStream Signed"/>
+				</Do>
+			</Node>
+		</Agent>
+		<Aggregate Name="TargetPlatforms_SimplyStream" Label="Platforms/SimplyStream" Requires="Compile UnrealGame SimplyStream"/>
+	</Extend>
+
+	<Extend Name="Platform_AddInstalledRequirements">
+		<Do If="$(WithSimplyStream)">
+			<Property Name="InstalledRequirements" Value="$(InstalledRequirements);#UnrealGame SimplyStream"/>
+		</Do>
+	</Extend>
+
+	<Extend Name="Platform_Append_DDCPlatformsWin64">
+		<Do If="$(WithSimplyStream)">
+			<Property Name="DDCPlatformsMac" Value="$(DDCPlatformsMac)+SimplyStream"/>
+		</Do>
+	</Extend>
+
+	<Extend Name="Platform_TagDDCFiles">
+		<Do If="$(WithSimplyStream)">
+			<!-- Copy utilities/tools -->
+			<Tag Files="Engine\Binaries\DotNET\SimplyStream\..." With="#ToCopy"/>
+		</Do>
+	</Extend>
+
+	<Extend Name="Platform_Tag_UnrealGame">
+		<Do If="$(WithSimplyStream)">
+			<Property Name="CopySimplyStreamFilter">
+				<!-- Build Files -->
+				Engine/Build/SimplyStream/...
+				Engine/Binaries/SimplyStream/...
+				Engine/Platforms/SimplyStream/Binaries/...
+				Engine/Platforms/SimplyStream/Build/...
+				Engine/source/shell2.js
+				Engine/source/simplystream.html
+				Engine/source/simplystream.js
+				Engine/AssetProcessorClient.exe
+				Engine/Platforms/SimplyStream/emsdk/...
+				Engine/Binaries/AutomationScripts/SimplyStream/...
+			</Property>
+			<Property Name="CopySimplyStreamExceptions">
+			</Property>
+			<Tag Files="#UnrealGame SimplyStream" With="#Installed Mac"/>
+			<Property Name="Platforms" Value="$(Platforms)SimplyStream;"/>
+			<Property Name="CopyInstalledFilter" Value="$(CopyInstalledFilter);$(CopySimplyStreamFilter)"/>
+			<Property Name="CopyInstalledExceptions" Value="$(CopyInstalledExceptions);$(CopySimplyStreamExceptions)"/>
+		</Do>
+		<Do If="!$(WithSimplyStream)">
+			<Property Name="CopySimplyStreamCsToolsExceptions">
+				Engine\Saved\CsTools\Engine\Intermediate\ScriptModules\SimplyStream.Automation.json
+			</Property>
+			<Property Name="CopyMacCsToolsExceptions" Value="$(CopyMacCsToolsExceptions);$(CopySimplyStreamCsToolsExceptions)"/>
+			<Property Name="CopyWin64CsToolsExceptions" Value="$(CopyWin64CsToolsExceptions);$(CopySimplyStreamCsToolsExceptions)"/>
+			<Property Name="CopyLinuxCsToolsExceptions" Value="$(CopyLinuxCsToolsExceptions);$(CopySimplyStreamCsToolsExceptions)"/>
+		</Do>
+	</Extend>
+
+</BuildGraph>

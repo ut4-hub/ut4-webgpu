@@ -1,0 +1,6 @@
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/CMakeFiles/ogg.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/CMakeFiles/edit_cache.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/CMakeFiles/rebuild_cache.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/CMakeFiles/list_install_components.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/CMakeFiles/install.dir
+C:/P4/Engine/Platforms/Wasm/Build/BatchFiles/ThirdParty/Ogg/BUILD_O0/CMakeFiles/install/local.dir

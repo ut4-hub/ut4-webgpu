@@ -1,0 +1,11 @@
+{
+	"FileVersion" : 3,
+	"bIsPluginExtension": true,
+	"Modules" :
+	[
+		{
+			"Name": "HTTPChunkInstaller",
+			"Type": "Runtime"
+		}
+	]
+}

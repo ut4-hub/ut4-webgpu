@@ -1,0 +1,585 @@
+// DawnRHI — concrete FRHI* resource wrappers holding Dawn (webgpu.h) objects.
+#pragma once
+
+#include "DawnRHIPrivate.h"
+#include <stdio.h> // wndr UBDEAD diag
+
+// LIVEHANDLE registry (getJsObject-abort fix — see DawnDynamicRHI.cpp): all
+// bind-group-visible WGPU handles register on create, unregister on release.
+void DawnLiveHandleAdd(void* H);
+void DawnLiveHandleRemove(void* H);
+void DawnUBPoolRetire(WGPUBuffer B, uint64 Size); // wndr BGCACHE-2/UBPOOL-1 (DawnDynamicRHI.cpp)
+bool DawnLiveHandleCheck(void* H);
+
+class FDawnSamplerState : public FRHISamplerState
+{
+public:
+	FSamplerStateInitializerRHI Initializer;
+	WGPUSampler Sampler = nullptr;
+	explicit FDawnSamplerState(const FSamplerStateInitializerRHI& InInit) : Initializer(InInit) {}
+	~FDawnSamplerState()
+	{
+		if (Sampler) { DawnLiveHandleRemove((void*)Sampler); wgpuSamplerRelease(Sampler); }
+	}
+};
+
+class FDawnRasterizerState : public FRHIRasterizerState
+{
+public:
+	FRasterizerStateInitializerRHI Initializer;
+	explicit FDawnRasterizerState(const FRasterizerStateInitializerRHI& InInit) : Initializer(InInit) {}
+	virtual bool GetInitializer(FRasterizerStateInitializerRHI& Init) override { Init = Initializer; return true; }
+};
+
+class FDawnDepthStencilState : public FRHIDepthStencilState
+{
+public:
+	FDepthStencilStateInitializerRHI Initializer;
+	explicit FDawnDepthStencilState(const FDepthStencilStateInitializerRHI& InInit) : Initializer(InInit) {}
+	virtual bool GetInitializer(FDepthStencilStateInitializerRHI& Init) override { Init = Initializer; return true; }
+};
+
+class FDawnBlendState : public FRHIBlendState
+{
+public:
+	FBlendStateInitializerRHI Initializer;
+	explicit FDawnBlendState(const FBlendStateInitializerRHI& InInit) : Initializer(InInit) {}
+	virtual bool GetInitializer(FBlendStateInitializerRHI& Init) override { Init = Initializer; return true; }
+};
+
+class FDawnVertexDeclaration : public FRHIVertexDeclaration
+{
+public:
+	FVertexDeclarationElementList Elements;
+	explicit FDawnVertexDeclaration(const FVertexDeclarationElementList& InElements) : Elements(InElements) {}
+	virtual bool GetInitializer(FVertexDeclarationElementList& Init) override { Init = Elements; return true; }
+};
+
+// Milestone step 1: a shader's real reflected resource bindings, as read
+// off the actual cooked SPIR-V/WGSL by DawnShaderCompiler.cpp/
+// tools/dawn_tint_bridge.cpp's ReflectBindings (see DawnShaderCompiler.cpp's
+// ParameterMap population) — replaces the old fixed
+// {UB@0,Texture@1,Sampler@2} @group(0) assumption. Populated directly on
+// FDawnVertexShader/FDawnPixelShader by whatever creates them from a real
+// cook (today: DawnRHITestMain's real-shader render path, reading the
+// sidecar reflection DawnCookProbe writes; tomorrow: a real engine
+// shader-map loader reading Output.ParameterMap back out). Empty is
+// legitimate for a shader that binds no resources.
+enum class EDawnShaderBindingKind : uint8
+{
+	Unknown = 0,
+	UniformBuffer = 1,
+	Texture = 2,
+	Sampler = 3,
+};
+
+struct FDawnShaderBinding
+{
+	uint32 Group = 0;
+	uint32 Binding = 0;
+	EDawnShaderBindingKind Kind = EDawnShaderBindingKind::Unknown;
+	FString Name;
+	// Texture bindings only: the view dimension + sample type the WGSL declares
+	// (texture_cube<f32>, texture_depth_2d, texture_2d<u32>, ...), parsed by
+	// ParseWgslBindings. The pipeline's bind-group-LAYOUT entry must match the
+	// shader's declared dimension EXACTLY or wgpuDeviceCreateRenderPipeline
+	// fails validation — the mobile base pass reflection/sky cubemap
+	// (texture_cube) was the first non-2D case to hit this. Defaults preserve
+	// the old hardcoded 2D/Float behaviour for anything not explicitly parsed.
+	WGPUTextureViewDimension TexViewDim = WGPUTextureViewDimension_2D;
+	WGPUTextureSampleType TexSampleType = WGPUTextureSampleType_Float;
+	// Sampler bindings only: true when the WGSL declares sampler_comparison
+	// (shadow-map PCF sampling); the layout entry must then be Comparison.
+	bool bComparisonSampler = false;
+	// Buffer bindings only (Kind == UniformBuffer): the address space the WGSL
+	// declares — var<uniform> -> Uniform, var<storage, read> -> ReadOnlyStorage,
+	// var<storage, read_write> -> Storage — parsed by ParseWgslBindings. The
+	// bind-group-LAYOUT entry's buffer.type must match it EXACTLY or
+	// wgpuDeviceCreateRenderPipeline fails validation (mobile fog VS/PS and
+	// the instanced-stereo Main were the first to declare read-only storage).
+	// Default preserves the old hardcoded Uniform behaviour.
+	WGPUBufferBindingType BufBindingType = WGPUBufferBindingType_Uniform;
+};
+
+// Stage 1 shader contract (OUR OWN, not SimplyStream's): FRHICreateShaderDesc::Code
+// is raw UTF-8 WGSL *source text* for a single entry point. The fixed entry
+// point names below ("vs_main" / "fs_main") are this module's convention.
+// A later stage replaces hand-authored WGSL with HLSL->SPIR-V->WGSL (Tint)
+// output using the same Code-is-WGSL-text contract.
+class FDawnVertexShader : public FRHIVertexShader
+{
+public:
+	FString WGSLSource;
+	WGPUShaderModule ShaderModule = nullptr;
+
+	// Milestone step 1/2: real WGSL entry points keep their real name (e.g.
+	// "ScreenPassVS" from a real cooked UE shader), not the Stage 1
+	// hand-authored convention below -- see ParseWgslEntryPoint() in
+	// DawnDynamicRHI.cpp, which sets this from the actual cooked WGSL text
+	// (@vertex fn <Name>) at RHICreateVertexShader time. Defaults to the old
+	// fixed name so the still-supported Stage 1/2 hand-authored WGSL test
+	// paths (whose shaders really are named vs_main) need no changes.
+	FString EntryPoint = TEXT("vs_main");
+
+	// Milestone step 1: real reflected bindings (see FDawnShaderBinding above).
+	// Empty for the Stage 1/2 hand-authored WGSL paths (those already agree
+	// with the old fixed group(0){0,1,2} layout by construction); populated
+	// for real-cooked shaders so RHICreateGraphicsPipelineState can build a
+	// reflection-driven BindGroupLayout instead of assuming fixed slots.
+	TArray<FDawnShaderBinding> Bindings;
+};
+
+class FDawnPixelShader : public FRHIPixelShader
+{
+public:
+	FString WGSLSource;
+	WGPUShaderModule ShaderModule = nullptr;
+	FString EntryPoint = TEXT("fs_main"); // see FDawnVertexShader::EntryPoint above
+
+	TArray<FDawnShaderBinding> Bindings;
+};
+
+// Compute is not supported by DawnRHI (WebGPU compute + the mobile renderer's compute
+// shaders that don't cross-compile). These stubs exist so compute create/dispatch calls
+// return valid-but-inert objects instead of crashing; the command context skips them.
+class FDawnComputeShader : public FRHIComputeShader
+{
+public:
+	FDawnComputeShader() = default;
+};
+
+class FDawnComputePipelineState : public FRHIComputePipelineState
+{
+public:
+	explicit FDawnComputePipelineState(FRHIComputeShader* InCS = nullptr) : FRHIComputePipelineState(InCS) {}
+};
+
+class FDawnGraphicsPipelineState : public FRHIGraphicsPipelineState
+{
+public:
+	WGPURenderPipeline Pipeline = nullptr;
+	// STRIPIDX fix: WebGPU bakes stripIndexFormat into the pipeline, but UE
+	// reuses one PSO across 16- and 32-bit index buffers (trail/ribbon
+	// particles: ParticleSystemRender.cpp Source.IndexStride is uint16 for
+	// small trails, uint32 for large). Strip-topology PSOs therefore carry
+	// BOTH variants: Pipeline = stripIndexFormat Uint16 (also serves
+	// non-indexed draws — stripIndexFormat only constrains INDEXED draws),
+	// PipelineStrip32 = Uint32. RHIDrawIndexedPrimitive binds the variant
+	// matching the bound index buffer's stride. Null for list topologies.
+	// (Leaving stripIndexFormat Undefined made every indexed strip draw a
+	// Dawn validation error that poisoned the whole per-frame command buffer
+	// — 190 cascading errors, frozen presented frame, in-match freeze.)
+	WGPURenderPipeline PipelineStrip32 = nullptr;
+	// FRAGLESS: true = depth-only pipeline (null pixel shader, fragment=nullptr
+	// — valid WebGPU). Depth prepass / CSM shadow-depth PSOs are legitimately
+	// PS-less; the old code returned an INERT PSO for them, silently skipping
+	// every prepass/shadow draw. The draw path must only use these inside
+	// passes with NO color attachment (attachment-compatibility guard).
+	bool bFragmentless = false;
+	TRefCountPtr<FDawnVertexShader> VertexShader;
+	TRefCountPtr<FDawnPixelShader> PixelShader;
+
+	// Multi-stream vertex input (black-world fix): bit S set => the pipeline
+	// declared a vertex-buffer layout at slot S (slot index == the vertex
+	// declaration's StreamIndex). The draw path binds the command context's
+	// per-stream bound buffer to each set slot; a set slot with no bound
+	// buffer skips the draw (Dawn "missing vertex buffer" would invalidate
+	// the whole command buffer). 0 = pipeline takes no vertex buffers.
+	uint32 VertexStreamMask = 0;
+
+	// VTXPADFIX: slot of the stride-0 dummy stream added at pipeline build to
+	// satisfy shader-consumed attribute locations the vertex declaration
+	// omitted (Dawn "Vertex attribute slot N ... not present in VertexState").
+	// -1 = no padding. The draw path binds the shared zero vertex buffer here
+	// (RHISetStreamSource never targets this slot).
+	int32 DummyVertexStreamSlot = -1;
+
+	// PRIMTYPE fix (the per-frame "Vertex range ... requires a larger buffer"
+	// poison): the initializer's primitive type. The draw path derives vertex/
+	// index counts from NumPrimitives with THIS — the old hardcoded
+	// NumPrimitives*3 turned every PT_LineList batched-elements draw (4 lines
+	// = 8 verts in an exactly-sized 512-byte buffer) into a 12-vertex request,
+	// a Dawn validation error that invalidated the WHOLE command buffer every
+	// frame (presentedFrame=-1). The pipeline's WGPU topology is translated
+	// from this too (lines/points used to rasterize as bogus triangles).
+	uint32 PrimitiveType = 0; // EPrimitiveType (PT_TriangleList)
+
+	// INSTSTEP fix: per-slot vertex input rate + stride, mirroring the
+	// pipeline's WGPUVertexBufferLayouts. Bit S of InstanceStreamMask set =>
+	// slot S steps per-instance (FVertexElement::bUseInstanceIndex, exactly
+	// like VulkanRHI's VK_VERTEX_INPUT_RATE_INSTANCE). The draw path uses
+	// these to range-check each draw against the bound buffers (VTXRANGE
+	// guard) so an under-sized bind skips ONE draw instead of poisoning the
+	// whole command buffer.
+	uint32 InstanceStreamMask = 0;
+	uint16 StreamStrides[17] = {}; // == FDawnCommandContext::MaxVertexStreams
+
+	// Stage 2 convention (no shader reflection yet — that lands with the real
+	// shader-cook pipeline): a single, fixed @group(0) bind group layout used
+	// by every PSO — binding 0 = uniform buffer (vertex+fragment visible),
+	// binding 1 = texture (fragment), binding 2 = sampler (fragment). Shaders
+	// that don't use all three simply don't declare the unused bindings in
+	// WGSL; Dawn only requires the *bind group* contents to satisfy whatever
+	// the shader actually references, not the other way around.
+	//
+	// Multi-@group fix (this session): real reflected bindings carry their
+	// own FDawnShaderBinding::Group (see above), but until now
+	// RHICreateGraphicsPipelineState silently ignored it and always built
+	// exactly one WGPUBindGroupLayout/PipelineLayout with
+	// bindGroupLayoutCount=1 — every reflected binding was folded into
+	// @group(0) regardless of what the real cooked WGSL declared. Empirically
+	// every real UE global shader cooked through this toolchain so far
+	// (ScreenPass.usf, DistortApplyScreenPS.usf — see HANDOFF.md "Update 12")
+	// DOES land entirely in @group(0) (ShaderConductor's DXC->SPIR-V path
+	// assigns one flat descriptor set here), so the bug was latent/untested
+	// rather than a live symptom — but it was still a real correctness gap
+	// for any future shader that legitimately reflects >1 group. Now:
+	// BindGroupLayouts/PipelineLayout are keyed by the real distinct Group
+	// values found across VS+PS bindings (still exactly 1 entry for every
+	// real shader cooked so far, 0-length falls back to the old fixed
+	// single-@group(0) 3-slot convention below for the Stage 1/2
+	// hand-authored WGSL paths).
+	TArray<WGPUBindGroupLayout> BindGroupLayouts;
+	// wndr BINDLEAN-1: per-group reflected VS+PS layout, built once on first draw.
+	mutable TMap<uint32, TArray<FDawnShaderBinding>> WndrLayoutByGroup;
+	mutable bool bWndrLayoutBuilt = false;
+	mutable uint64 WndrSerial = 0; // wndr WALKCACHE-1
+	WGPUPipelineLayout PipelineLayout = nullptr;
+
+	virtual FRHIGraphicsShader* GetShader(EShaderFrequency Frequency) const override
+	{
+		switch (Frequency)
+		{
+		case SF_Vertex: return VertexShader.GetReference();
+		case SF_Pixel:  return PixelShader.GetReference();
+		default:        return nullptr;
+		}
+	}
+
+	~FDawnGraphicsPipelineState()
+	{
+		if (Pipeline) { wgpuRenderPipelineRelease(Pipeline); }
+		if (PipelineStrip32) { wgpuRenderPipelineRelease(PipelineStrip32); }
+		if (PipelineLayout) { wgpuPipelineLayoutRelease(PipelineLayout); }
+		for (WGPUBindGroupLayout Layout : BindGroupLayouts) { if (Layout) { wgpuBindGroupLayoutRelease(Layout); } }
+	}
+};
+
+class FDawnBuffer : public FRHIBuffer
+{
+public:
+	WGPUBuffer Buffer = nullptr;
+	uint32 WgpuSize = 0;
+	// CPU-staging lock state (RHILockBuffer/RHIUnlockBuffer): WebGPU buffer
+	// mapping is async, so CPU access uses a staging alloc uploaded on unlock.
+	void* LockStaging = nullptr;
+	uint32 LockOffset = 0;
+	uint32 LockSize = 0;
+	// READLOCK-WIPE fix: read-only locks hand out a ZERO-filled staging (no
+	// sync readback on WebGPU); unlock must NOT write that staging back or it
+	// destroys the buffer's real GPU contents (collision/nav read-locks on
+	// map load were zeroing mesh vertex buffers -> sliver world).
+	bool bLockReadOnly = false;
+
+	explicit FDawnBuffer(const FRHIBufferCreateDesc& CreateDesc) : FRHIBuffer(CreateDesc) {}
+	~FDawnBuffer()
+	{
+		if (Buffer) { DawnLiveHandleRemove((void*)Buffer); wgpuBufferRelease(Buffer); }
+	}
+};
+
+class FDawnShaderResourceView : public FRHIShaderResourceView
+{
+public:
+	// Pre-resolved WGPU handle so binding is a simple field read. Exactly one of
+	// TextureView / Buffer is set depending on the view type.
+	WGPUTextureView TextureView = nullptr;
+	WGPUBuffer Buffer = nullptr;
+	uint32 BufferSize = 0;
+	FDawnShaderResourceView(FRHIViewableResource* InResource, const FRHIViewDesc& InViewDesc)
+		: FRHIShaderResourceView(InResource, InViewDesc) {}
+};
+
+class FDawnUnorderedAccessView : public FRHIUnorderedAccessView
+{
+public:
+	WGPUTextureView TextureView = nullptr;
+	WGPUBuffer Buffer = nullptr;
+	uint32 BufferSize = 0;
+	FDawnUnorderedAccessView(FRHIViewableResource* InResource, const FRHIViewDesc& InViewDesc)
+		: FRHIUnorderedAccessView(InResource, InViewDesc) {}
+};
+
+class FDawnViewport : public FRHIViewport
+{
+public:
+	WGPUSurface Surface = nullptr;
+	uint32 Width = 0, Height = 0;
+	WGPUTextureFormat Format = WGPUTextureFormat_BGRA8Unorm;
+	FTextureRHIRef BackBuffer;
+	FTextureRHIRef PendingRelease; // surface texture from the previous frame, released next acquire (after present)
+	WGPUTexture PrevSurfTex = nullptr;        // deferred-release of the persistent backbuffer's prior surface texture
+	WGPUTextureView PrevSurfView = nullptr;
+	FDawnViewport() : FRHIViewport() {}
+	~FDawnViewport() { if (Surface) { wgpuSurfaceRelease(Surface); } }
+};
+
+// UBREGISTRY (owner-pairing fix): WGPUBuffer -> FDawnUniformBuffer lookup so
+// the bind-group builder can resolve THIS DRAW's Material UB (the one bound at
+// the group's "Material" constant binding) to its captured resource table.
+void DawnUBRegistryRemove(void* WgpuBuf); // DawnDynamicRHI.cpp
+
+class FDawnUniformBuffer : public FRHIUniformBuffer
+{
+public:
+	WGPUBuffer Buffer = nullptr;
+
+	// UBRESTABLE (the black-world/collapsed-bots root-cause fix): UE delivers
+	// a uniform buffer's TEXTURE/SAMPLER/SRV members (material albedo
+	// Material_Texture2D_0, lightmaps, reflection captures, GPUSkin bone
+	// matrices) inside the UB's RESOURCE TABLE — raw FRHIResource* pointers
+	// embedded in the Contents blob at Layout.Resources[].MemberOffset. They
+	// are NEVER sent as loose RHISetShaderParameters params; the RHI must
+	// extract and bind them itself. DawnRHI ignored the table, so every such
+	// WGSL binding fell to the zero/black dummy (black albedo -> black world;
+	// zero bone matrices -> bots collapsed to a point). Captured at
+	// create/update (DawnCaptureUBResourceTable), consumed at bind-group
+	// build (FlushPendingBindGroups UBRESTABLE fill) by matching the
+	// reflected WGSL binding name "<ShaderName>_<WgslName>".
+	FString ShaderName; // WGSL var name of this UB ("Material", "GPUSkinVFBase", ...)
+	uint64 WndrSerial = 0;      // wndr WALKCACHE-1: unique id (pointer values get reused)
+	uint32 WndrResVersion = 0;  // wndr WALKCACHE-1: bumped on every resource-table capture
+	uint64 WndrContentHash = 0; uint32 WndrContentHashVer = 0xFFFFFFFFu; // wndr WALKCACHE-2: (buffer handle, ResTable resources) hash
+	FString WndrDerivedName, WndrDerivedNameBuf; bool bWndrDerivedNameSet = false; // wndr UBNAMECACHE-1
+	struct FTableEntry
+	{
+		FString WgslName;                  // flattened member name ("Texture2D_0", "Common_BoneMatrices")
+		TRefCountPtr<FRHIResource> Resource;
+		uint8 MemberType;                  // EUniformBufferBaseType
+	};
+	TArray<FTableEntry> ResTable;
+	TArray<uint8> LastUploadBytes; // WNDR per-draw probe: cached CPU bytes of the last upload (Primitive UBs)
+
+	explicit FDawnUniformBuffer(const FRHIUniformBufferLayout* InLayout) : FRHIUniformBuffer(InLayout) {}
+	~FDawnUniformBuffer()
+	{
+#if PLATFORM_WASM
+		// wndr UBDEAD diag: a ResTable entry whose resource is already dead -> name the UB + member,
+		// and drop it WITHOUT Release (the release would hit freed/reused memory).
+		for (FTableEntry& E : ResTable)
+		{
+			FRHIResource* R = E.Resource.GetReference();
+			if (R && !R->IsValid())
+			{
+				static uint32 _ud = 0;
+				if (_ud++ < 40) { printf("WNDR UBDEAD ub=%s sn=%s member=%s mt=%d res=%p rtype=%d\n", TCHAR_TO_UTF8(*GetLayout().GetDebugName()), TCHAR_TO_UTF8(*ShaderName), TCHAR_TO_UTF8(*E.WgslName), (int)E.MemberType, (void*)R, (int)R->GetType()); fflush(stdout); }
+				*reinterpret_cast<FRHIResource**>(&E.Resource) = nullptr;
+			}
+		}
+#endif
+		if (Buffer) { DawnUBRegistryRemove((void*)Buffer); DawnUBPoolRetire(Buffer, 0); } // wndr BGCACHE-2/UBPOOL-1: recycle (stays live)
+	}
+};
+
+class FDawnTexture : public FRHITexture
+{
+public:
+	WGPUTexture Texture = nullptr;
+	WGPUTextureView View = nullptr;
+	WGPUTextureView RTView = nullptr; // single-mip view for render-target/depth attachment binding
+	bool bOwnsTexture = true;
+	void* LockStaging = nullptr;
+	uint32 LockMip = 0, LockW = 0, LockH = 0, LockStride = 0, LockRows = 0, LockBlockX = 1;
+	uint32 LockLayer = 0; // destination array layer (cube face / array slice)
+	uint64 LockSize = 0;
+
+	explicit FDawnTexture(const FRHITextureCreateDesc& CreateDesc) : FRHITexture(CreateDesc) {}
+	~FDawnTexture()
+	{
+		DawnLiveHandleRemove((void*)View); DawnLiveHandleRemove((void*)RTView); // LIVEHANDLE
+		if (RTView) { wgpuTextureViewRelease(RTView); }
+		if (View) { wgpuTextureViewRelease(View); }
+		if (Texture && bOwnsTexture) { wgpuTextureRelease(Texture); }
+	}
+
+	virtual void* GetNativeResource() const override { return Texture; }
+};
+
+// COMPRESSEDFIX (black-world root cause): compressed texture support flags,
+// set at device creation from wgpuAdapterHasFeature (the features are also
+// added to requiredFeatures). The old code assumed "Apple WebGPU has no BC
+// support", created BC textures as RGBA8 substitutes and SKIPPED their
+// uploads — every DXT/BC albedo, normal and LIGHTMAP in the map stayed a
+// zero texture: black surfaces, black GI, while the uncompressed UI worked.
+// Chrome/Dawn on Apple Silicon exposes texture-compression-bc (and etc2/astc).
+extern bool GDawnBCTextureSupport;
+extern bool GDawnETC2TextureSupport;
+extern bool GDawnASTCTextureSupport;
+
+inline bool DawnIsCompressedFormatUploadable(EPixelFormat Format)
+{
+	switch (Format)
+	{
+	case PF_DXT1: case PF_DXT3: case PF_DXT5:
+	case PF_BC4: case PF_BC5: case PF_BC6H: case PF_BC7:
+		return GDawnBCTextureSupport;
+	case PF_ETC2_RGB: case PF_ETC2_RGBA: case PF_ETC2_R11_EAC: case PF_ETC2_RG11_EAC:
+		return GDawnETC2TextureSupport;
+	case PF_ASTC_4x4: case PF_ASTC_6x6: case PF_ASTC_8x8: case PF_ASTC_10x10: case PF_ASTC_12x12:
+		return GDawnASTCTextureSupport;
+	default:
+		return false;
+	}
+}
+
+// Helper: EPixelFormat -> WGPUTextureFormat. Stage 1 only needs RGBA8Unorm;
+// this is intentionally narrow and will grow as real content lands (Stage 2).
+inline WGPUTextureFormat DawnTextureFormatFromPixelFormat(EPixelFormat Format)
+{
+	switch (Format)
+	{
+	// COMPRESSEDFIX: real block-compressed formats whenever the device carries
+	// the matching feature (see DawnIsCompressedFormatUploadable); otherwise
+	// fall through to the RGBA8 substitute below (uploads skipped as before).
+	case PF_DXT1: if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC1RGBAUnorm; } break;
+	case PF_DXT3: if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC2RGBAUnorm; } break;
+	case PF_DXT5: if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC3RGBAUnorm; } break;
+	case PF_BC4:  if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC4RUnorm; } break;
+	case PF_BC5:  if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC5RGUnorm; } break;
+	case PF_BC6H: if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC6HRGBUfloat; } break;
+	case PF_BC7:  if (GDawnBCTextureSupport) { return WGPUTextureFormat_BC7RGBAUnorm; } break;
+	case PF_ETC2_RGB:      if (GDawnETC2TextureSupport) { return WGPUTextureFormat_ETC2RGB8Unorm; } break;
+	case PF_ETC2_RGBA:     if (GDawnETC2TextureSupport) { return WGPUTextureFormat_ETC2RGBA8Unorm; } break;
+	case PF_ETC2_R11_EAC:  if (GDawnETC2TextureSupport) { return WGPUTextureFormat_EACR11Unorm; } break;
+	case PF_ETC2_RG11_EAC: if (GDawnETC2TextureSupport) { return WGPUTextureFormat_EACRG11Unorm; } break;
+	case PF_ASTC_4x4:   if (GDawnASTCTextureSupport) { return WGPUTextureFormat_ASTC4x4Unorm; } break;
+	case PF_ASTC_6x6:   if (GDawnASTCTextureSupport) { return WGPUTextureFormat_ASTC6x6Unorm; } break;
+	case PF_ASTC_8x8:   if (GDawnASTCTextureSupport) { return WGPUTextureFormat_ASTC8x8Unorm; } break;
+	case PF_ASTC_10x10: if (GDawnASTCTextureSupport) { return WGPUTextureFormat_ASTC10x10Unorm; } break;
+	case PF_ASTC_12x12: if (GDawnASTCTextureSupport) { return WGPUTextureFormat_ASTC12x12Unorm; } break;
+	default: break;
+	}
+	switch (Format)
+	{
+	case PF_R8G8B8A8:      return WGPUTextureFormat_RGBA8Unorm;
+	case PF_B8G8R8A8:      return WGPUTextureFormat_BGRA8Unorm;
+	case PF_FloatRGBA:     return WGPUTextureFormat_RGBA16Float;
+	// Narrow formats MUST map to a Dawn format of the SAME bytes-per-pixel as the
+	// engine's GPixelFormats[Format].BlockBytes, or wgpuQueueWriteTexture rejects
+	// the upload ("byte size of each row > bytesPerRow") and aborts. Fonts/UI use
+	// single-channel PF_G8/PF_A8 (1 byte) -> R8Unorm; 2-byte formats -> R16/RG8.
+	case PF_G8:            return WGPUTextureFormat_R8Unorm;   // 1B (Slate font atlases)
+	case PF_A8:            return WGPUTextureFormat_RGBA8Unorm; // no WebGPU A8; 1B coverage expanded to RGBA (a=cov) at upload so the grayscale-font shader's .w read works
+	case PF_R8:            return WGPUTextureFormat_R8Unorm;   // 1B
+	case PF_L8:            return WGPUTextureFormat_R8Unorm;   // 1B
+	case PF_R8G8:          return WGPUTextureFormat_RG8Unorm;  // 2B
+	case PF_R16F:          return WGPUTextureFormat_R16Float;  // 2B
+	case PF_R16F_FILTER:   return WGPUTextureFormat_R16Float;  // 2B
+	case PF_G16:           return WGPUTextureFormat_R16Float;  // 2B (approx, avoids abort)
+	case PF_R32_FLOAT:     return WGPUTextureFormat_R32Float;  // 4B
+	case PF_A2B10G10R10:   return WGPUTextureFormat_RGB10A2Unorm; // 4B
+	case PF_G16R16:        return WGPUTextureFormat_RG16Float; // 4B (approx)
+	case PF_G16R16F:       return WGPUTextureFormat_RG16Float; // 4B
+	case PF_A32B32G32R32F: return WGPUTextureFormat_RGBA32Float; // 16B
+	default:
+	{
+		// Generic catch-all: pick a Dawn format whose bytes-per-pixel equals the
+		// engine's GPixelFormats[Format].BlockBytes so the upload stride always
+		// matches (no "row > bytesPerRow" abort). Exact channel semantics may be
+		// approximate for uncommon formats, but the write validates and content loads.
+		const FPixelFormatInfo& _Info = GPixelFormats[Format];
+		if (_Info.BlockSizeX > 1) return WGPUTextureFormat_RGBA8Unorm; // BC/compressed -> RGBA8 (write skipped)
+		switch (_Info.BlockBytes)
+		{
+		case 1:  return WGPUTextureFormat_R8Unorm;
+		case 2:  return WGPUTextureFormat_RG8Unorm;
+		case 8:  return WGPUTextureFormat_RGBA16Float;
+		case 16: return WGPUTextureFormat_RGBA32Float;
+		default: return WGPUTextureFormat_RGBA8Unorm; // 4B and anything else
+		}
+	}
+	}
+}
+
+inline WGPUVertexFormat DawnVertexFormatFromElementType(EVertexElementType Type)
+{
+	switch (Type)
+	{
+	case VET_Float1: return WGPUVertexFormat_Float32;
+	case VET_Float2: return WGPUVertexFormat_Float32x2;
+	case VET_Float3: return WGPUVertexFormat_Float32x3;
+	case VET_Float4: return WGPUVertexFormat_Float32x4;
+	// Non-float element types must map to their REAL byte size, else the pipeline
+	// vertex stride check fails (e.g. FSlateVertex's VET_Color is 4 bytes, not 16).
+	case VET_PackedNormal: return WGPUVertexFormat_Snorm8x4; // wndr SNORMNORMAL-1 (int8 FPackedNormal, matches D3D/Vulkan SNORM)
+	case VET_UByte4:       return WGPUVertexFormat_Uint8x4;
+	case VET_UByte4N:      return WGPUVertexFormat_Unorm8x4;
+	case VET_Color:        return WGPUVertexFormat_Unorm8x4;
+	case VET_Short2:       return WGPUVertexFormat_Sint16x2;
+	case VET_Short4:       return WGPUVertexFormat_Sint16x4;
+	case VET_Short2N:      return WGPUVertexFormat_Snorm16x2;
+	case VET_Short4N:      return WGPUVertexFormat_Snorm16x4;
+	case VET_Half2:        return WGPUVertexFormat_Float16x2;
+	case VET_Half4:        return WGPUVertexFormat_Float16x4;
+	case VET_UShort2:      return WGPUVertexFormat_Uint16x2;
+	case VET_UShort4:      return WGPUVertexFormat_Uint16x4;
+	case VET_UShort2N:     return WGPUVertexFormat_Unorm16x2;
+	case VET_UShort4N:     return WGPUVertexFormat_Unorm16x4;
+	case VET_UInt:         return WGPUVertexFormat_Uint32;
+	default:         return WGPUVertexFormat_Float32x4;
+	}
+}
+
+// Stage 2: the fixed depth-buffer format DawnRHI uses whenever a PSO/render
+// pass asks for depth/stencil. Narrow on purpose (no stencil-capable variant
+// selection yet) — broadened alongside real content needs.
+inline WGPUTextureFormat DawnDepthStencilFormat()
+{
+	return WGPUTextureFormat_Depth24Plus;
+}
+
+inline WGPUCompareFunction DawnCompareFunctionFromRHI(ECompareFunction Fn)
+{
+	switch (Fn)
+	{
+	case CF_Less:         return WGPUCompareFunction_Less;
+	case CF_LessEqual:    return WGPUCompareFunction_LessEqual;
+	case CF_Greater:      return WGPUCompareFunction_Greater;
+	case CF_GreaterEqual: return WGPUCompareFunction_GreaterEqual;
+	case CF_Equal:        return WGPUCompareFunction_Equal;
+	case CF_NotEqual:     return WGPUCompareFunction_NotEqual;
+	case CF_Never:        return WGPUCompareFunction_Never;
+	case CF_Always:       return WGPUCompareFunction_Always;
+	default:              return WGPUCompareFunction_Always;
+	}
+}
+
+inline WGPUFilterMode DawnFilterModeFromRHI(ESamplerFilter Filter)
+{
+	switch (Filter)
+	{
+	case SF_Point:              return WGPUFilterMode_Nearest;
+	default:                    return WGPUFilterMode_Linear; // Bilinear/Trilinear/Anisotropic*
+	}
+}
+
+inline WGPUMipmapFilterMode DawnMipFilterModeFromRHI(ESamplerFilter Filter)
+{
+	switch (Filter)
+	{
+	case SF_Point:  return WGPUMipmapFilterMode_Nearest;
+	default:        return WGPUMipmapFilterMode_Linear;
+	}
+}
+
+inline WGPUAddressMode DawnAddressModeFromRHI(ESamplerAddressMode Mode)
+{
+	switch (Mode)
+	{
+	case AM_Wrap:   return WGPUAddressMode_Repeat;
+	case AM_Clamp:  return WGPUAddressMode_ClampToEdge;
+	case AM_Mirror: return WGPUAddressMode_MirrorRepeat;
+	case AM_Border: return WGPUAddressMode_ClampToEdge; // Dawn has no border-color address mode
+	default:        return WGPUAddressMode_ClampToEdge;
+	}
+}

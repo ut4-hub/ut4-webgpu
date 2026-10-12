@@ -1,0 +1,31 @@
+{
+	"version": 1,
+	"thirdParty": {
+		"memoryMode": 0,
+		"libraries": [
+			"blake3",
+			"ogg",
+			"vorbis",
+			"opus",
+			"png",
+			"icu",
+			"harfbuzz",
+			"freetype",
+			"rad",
+			"oodle"
+		],
+		"archives": [
+			{"library": "blake3", "path": "Source/ThirdParty/Blake3/1.3.1/lib/wasm32/libBLAKE3.a", "sha256": "3157dd5032a9705f0a5ed597bb7ae6d6e9bdb9c21c472583792aec702e147fa8"},
+			{"library": "ogg", "path": "Source/ThirdParty/Ogg/libogg-1.2.2/lib/wasm32/libogg.a", "sha256": "fc7a1a7f0a4750fbe007afcc15b2c709cbff506225ab1201f4e0c7ee35ae3f85"},
+			{"library": "vorbis", "path": "Source/ThirdParty/Vorbis/libvorbis-1.3.2/lib/wasm32/libvorbis.a", "sha256": "cc8eb8cdf9b67473442f962686b9f4444baa420f88fca6686a5cddf6518064f0"},
+			{"library": "vorbis", "path": "Source/ThirdParty/Vorbis/libvorbis-1.3.2/lib/wasm32/libvorbisfile.a", "sha256": "a46c52a81f82f4ad13c19e5d4662835ce639d84a397786b334bd550ba1dcf4c2"},
+			{"library": "opus", "path": "Source/ThirdParty/libOpus/opus-1.1/lib/wasm32/libopus.a", "sha256": "8e54e18f09524b445771640cf9799ce7c61a211f2207265174a9dd6046e36aba"},
+			{"library": "png", "path": "Source/ThirdParty/libPNG/libPNG-1.6.44/lib/wasm32/libpng.a", "sha256": "d4a779b91a4e38efa360fdd448cc05ac1fe29a586e4e6e3c33d12b1aaac84339"},
+			{"library": "icu", "path": "Source/ThirdParty/ICU/icu4c-64_1/lib/wasm32/libicu.a", "sha256": "85a4d472c9528a8ed311b02687f31491be03832220021d3b50572d7744a00bf2"},
+			{"library": "harfbuzz", "path": "Source/ThirdParty/HarfBuzz/harfbuzz-2.4.0/lib/wasm32/libharfbuzz.a", "sha256": "3c81ab1bd13d398a8efdf75300acb4b90425ae45bf06310a04eb6b3fb30cab08"},
+			{"library": "freetype", "path": "Source/ThirdParty/FreeType2/FreeType2-2.10.0/lib/wasm32/libfreetype.a", "sha256": "08652cabf5149a3e5173e0dfbd079a7ad24c4ce5c7094dd9437090f752ae623c"},
+			{"library": "rad", "path": "Source/Runtime/SDK/Lib/libradaudio_decoder_wasm32.a", "sha256": "9a7db41e554b6f43685fc69949086453f6ed3ad6b2a22b332c5fb8bf8b7985d0"},
+			{"library": "oodle", "path": "Source/Runtime/OodleDataCompression/Sdks/2.9.14/lib/wasm32/liboodle.a", "sha256": "0f225a437ec27a70ea729141d68bffd134ae6e56f2cc959328a5039e7beb9aa1"}
+		]
+	}
+}

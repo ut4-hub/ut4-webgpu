@@ -1,0 +1,14 @@
+{
+	"FileVersion" : 3,
+	"bIsPluginExtension": true,
+	"Modules" :
+	[
+		{
+			"Name": "ProceduralMeshComponent",
+			"Type": "Runtime",
+			"BlacklistPlatforms": [
+				"SimplyStream"
+			]
+		}
+	]
+}

@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ut4-hub-pick-haus
+  namespace: websites
+  labels:
+    app: ut4-hub-pick-haus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # RWO volume
+  selector:
+    matchLabels:
+      app: ut4-hub-pick-haus
+  template:
+    metadata:
+      labels:
+        app: ut4-hub-pick-haus
+    spec:
+      securityContext:
+        fsGroup: 101 # nginx-unprivileged uid/gid; lets uploads via kubectl exec write the PVC
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: content
+              mountPath: /usr/share/nginx/html
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "2Gi" # write cache from multi-GB uploads counts toward the cgroup (256Mi got OOMKilled)
+              cpu: "1"
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+      volumes:
+        - name: content
+          persistentVolumeClaim:
+            claimName: ut4-hub-pick-haus-content
+        - name: nginx-conf
+          configMap:
+            name: ut4-hub-pick-haus-nginx

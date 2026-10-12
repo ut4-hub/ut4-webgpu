@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ut4-hub-pick-haus-nginx
+  namespace: websites
+  annotations:
+    # nginx config uses $-variables; keep Flux postBuild envsubst away from it.
+    kustomize.toolkit.fluxcd.io/substitute: disabled
+data:
+  nginx.conf: |
+    worker_processes auto;
+    error_log /dev/stderr notice;
+    pid /tmp/nginx.pid;
+    events { worker_connections 1024; }
+    http {
+      client_body_temp_path /tmp/client_temp;
+      proxy_temp_path /tmp/proxy_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+      include /etc/nginx/mime.types;
+      types { application/wasm wasm; }
+      default_type application/octet-stream;
+      access_log off;
+      sendfile on;
+      tcp_nopush on;
+      keepalive_timeout 65;
+      gzip on;
+      gzip_types text/html application/javascript text/css;
+
+      server {
+        listen 8080;
+        root /usr/share/nginx/html;
+        index index.html;
+
+        # Cross-origin isolation (SharedArrayBuffer for the wasm pthreads) on
+        # EVERY response. add_header in a location replaces the server-level
+        # set, so each location repeats them.
+        location ~ \.data$ {
+          add_header Cross-Origin-Opener-Policy same-origin always;
+          add_header Cross-Origin-Embedder-Policy require-corp always;
+          add_header Cross-Origin-Resource-Policy cross-origin always;
+          # Content packs: cache a week so returning players skip the 7.6 GB.
+          add_header Cache-Control "public, max-age=604800" always;
+        }
+        location / {
+          add_header Cross-Origin-Opener-Policy same-origin always;
+          add_header Cross-Origin-Embedder-Policy require-corp always;
+          add_header Cross-Origin-Resource-Policy cross-origin always;
+          # wasm/js/html change every engine rebuild: always revalidate (ETag).
+          add_header Cache-Control "no-cache" always;
+        }
+      }
+    }

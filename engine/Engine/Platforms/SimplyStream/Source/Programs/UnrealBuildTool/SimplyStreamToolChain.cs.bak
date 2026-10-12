@@ -1,0 +1,2594 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using EpicGames.Core;
+using Microsoft.Extensions.Logging;
+using UnrealBuildBase;
+
+namespace UnrealBuildTool
+{
+	class SimplyStreamToolChain : ClangToolChain
+	{
+		const int Memory32CompatibilityEpoch = 25;
+
+		public enum MemoryMode
+		{
+			Memory32,
+			Memory64,
+			Memory64_Emulated,
+		};
+
+		internal static MemoryMode ParseMemoryMode(string? Name)
+		{
+			if (string.IsNullOrWhiteSpace(Name))
+			{
+				return MemoryMode.Memory64_Emulated;
+			}
+			return Name switch
+			{
+				"Memory64_Emulated" => MemoryMode.Memory64_Emulated,
+				"Memory32" => MemoryMode.Memory32,
+				"Memory64" => MemoryMode.Memory64,
+				_ => throw new BuildException(
+					$"Unknown EmscriptenMemoryMode '{Name}'. Expected Memory32, Memory64, or Memory64_Emulated."),
+			};
+		}
+
+		protected static string? ClangPath;
+		protected static string? ArPath;
+
+		// ini configurations
+		static bool enableMultithreading = true;
+		static bool mt_lowthreads = true;
+		static bool enableTracing = false; // Debug option
+		static string ltoMode = "none";
+		static readonly HashSet<string> NoLtoModules = new HashSet<string>(StringComparer.Ordinal)
+		{
+			"IoStoreOnDemand",             // Shipping memory64: keep startup delegate/container code out of full-LTO merging
+			"IoStoreOnDemandCore",         // paired factory/callback side of the same Shipping startup path
+			"WebGPURHI",                    // the WebGPU RHI — the core rendering IP
+			"webgpu_utils",                 // WebGPU proxy/cache layer (Wonder)
+			"wgsl_pack",                    // WGSL shader packing (Wonder)
+			"wasm_utils",                   // asset tracker / cache client / pthreadfs (Wonder)
+			"SimplyStreamJS",               // JS bridge
+			"SimplyStreamPlatformFeatures", // platform features
+			"SimplyStreamAudioMixer",       // audio mixer
+		};
+		static string profilerMode = "none";
+		static bool enableShippingAssertions = false;
+		//static bool preserveSymbolsShipping = false;
+		static int initialMemoryMB = 2000;
+		static int maximumMemoryMB = 2000;
+		static bool useUnrealInsights = false;
+		static bool useUBsan = false;
+		static bool useAsan = false;
+		static bool useLsan = false;
+		static bool enableSAFE_HEAP = false;
+		static bool enableAA = true;
+		static bool enableDebug = false;
+		static bool enableDwarf5 = false; // debugging doesnt work well without this enabled, can crash compiler
+		static bool _enableSIMD = true;
+		static bool buildForNode = false;
+		static bool maximumOptimizations = false;
+		//static bool optimizeForFastDevBuilds = false;
+		readonly MemoryMode memoryMode;
+		bool IsMemory32 => memoryMode == MemoryMode.Memory32;
+		int Memory64Setting => memoryMode switch
+		{
+			MemoryMode.Memory32 => 0,
+			MemoryMode.Memory64 => 1,
+			MemoryMode.Memory64_Emulated => 2,
+			_ => throw new BuildException($"Unsupported Emscripten memory mode: {memoryMode}"),
+		};
+
+		public static bool enableSIMD
+		{
+			get
+			{
+				return _enableSIMD;
+			}
+		}
+
+		public static string libExt { get { return ".a"; } }
+		public static string objExt { get { return ".o"; } }
+		public static string h5LibPath { get { return "lib-" + SimplyStreamSDKInfo.EmscriptenVersion() + "-up-mt"; } }
+
+		// verbose feedback
+		delegate void VerbosePrint(CppConfiguration Configuration, bool bOptimizeForSize, ILogger Logger);  // proto
+		static VerbosePrint PrintOnce = new VerbosePrint(PrintOnceOn);                      // fn ptr
+		static void PrintOnceOff(CppConfiguration Configuration, bool bOptimizeForSize, ILogger Logger) { } // noop
+		static void PrintOnceOn(CppConfiguration Configuration, bool bOptimizeForSize, ILogger Logger)
+		{
+			PrintOnce = new VerbosePrint(PrintOnceOff); // clear
+		}
+
+		public SimplyStreamToolChain(FileReference? InProjectFile, ClangToolChainOptions ToolchainOptions, ILogger InLogger)
+			: base(ToolchainOptions, InLogger)
+		{
+			ConfigHierarchy Ini = ConfigCache.ReadHierarchy(ConfigHierarchyType.Engine, InProjectFile?.Directory, UnrealTargetPlatform.SimplyStream);
+
+
+			Ini.GetBool("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EnableMultithreading", out enableMultithreading);
+			Ini.GetBool("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EnableTracing", out enableTracing);
+			Ini.GetString("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EmscriptenLTOMode", out ltoMode);
+			Ini.GetString("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EmscriptenProfilerMode", out profilerMode);
+			Ini.GetInt32("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "InitialMemoryMB", out initialMemoryMB);
+			Ini.GetInt32("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "MaximumMemoryMB", out maximumMemoryMB);
+			Ini.GetBool("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EnableUnrealInsights", out useUnrealInsights);
+			Ini.GetBool("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EnableSIMD", out _enableSIMD);
+			Ini.GetBool("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EnableAA", out enableAA);
+			string memoryModeName = "Memory64_Emulated";
+			Ini.GetString("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "EmscriptenMemoryMode", out memoryModeName);
+			Ini.GetBool("/Script/SimplyStreamTargetPlatformSettings.SimplyStreamTargetSettings", "MaximumOptimizations", out maximumOptimizations);
+
+			string Hybrid = Environment.GetEnvironmentVariable("WNDR_BUILD_HYBRID")!;
+			if (!string.IsNullOrEmpty(Hybrid) && Hybrid == "1")
+			{
+				// Do something special
+				InLogger.LogInformation("h5conf SimplyStreamToolChain: WNDR_BUILD_HYBRID is set to 1, enabling special features.");
+				buildForNode = true;
+			} else
+			{
+				InLogger.LogInformation("h5conf SimplyStreamToolChain: WNDR_BUILD_HYBRID is not set to 1, normal build.");
+			}
+			if (string.IsNullOrWhiteSpace(memoryModeName))
+			{
+				InLogger.LogInformation("h5conf SimplyStreamToolChain: MemoryMode not set, defaulting to Memory64_Emulated");
+				memoryModeName = "Memory64_Emulated";
+			}
+			memoryMode = ParseMemoryMode(memoryModeName);
+
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: EnableMultithreading = {}", enableMultithreading);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: EnableTracing = {}", enableTracing);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: LTO mode = {}", ltoMode);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: Profiler mode = {}", profilerMode);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: InitialMemoryMB = {}", initialMemoryMB);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: MaximumMemoryMB = {}", maximumMemoryMB);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: EnableUnrealInsights = {}", useUnrealInsights);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: EnableAA = {}", enableAA);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: MemoryMode = {}", memoryMode);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: MaximumOptimizations = {}", maximumOptimizations);
+
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: EnableSIMD = {}", enableSIMD);
+			InLogger.LogInformation("h5conf SimplyStreamToolChain: 3rd party lib path = {}", h5LibPath);
+
+			PrintOnce = new VerbosePrint(PrintOnceOn); // reset
+			string Ext = OperatingSystem.IsWindows() ? ".bat" : "";
+			ClangPath = Path.Combine(SimplyStreamSDKInfo.EMSDK_ROOT.ToString(), $"upstream/emscripten/emcc{Ext}");
+			ArPath = Path.Combine(SimplyStreamSDKInfo.EMSDK_ROOT.ToString(), $"upstream/emscripten/emar{Ext}");
+
+			InLogger.LogInformation("h5conf Setting Emscripten SDK: located in " + SimplyStreamSDKInfo.EMSCRIPTEN_ROOT);
+			InLogger.LogInformation("h5conf Setting Emscripten SDK: located in " + SimplyStreamSDKInfo.EMSDK_ROOT);
+			InLogger.LogInformation("ClangPath: " + ClangPath);
+			InLogger.LogInformation("ArPath: " + ArPath);
+		}
+
+		class SimplyStreamToolChainInfo : ClangToolChainInfo
+		{
+			public SimplyStreamToolChainInfo(FileReference Clang, FileReference Archiver, ILogger Logger)
+				: base(new DirectoryReference(SimplyStreamSDKInfo.EMSDK_ROOT.ToString()), Clang, Archiver, Logger)
+			{ }
+			protected override string QueryClangVersionString() => Utils.RunLocalProcessAndReturnStdOut(Clang.FullName, "-v", null);
+			protected override string QueryArchiverVersionString() => Utils.RunLocalProcessAndReturnStdOut(Archiver.FullName, "--version", null);
+		}
+
+		protected override ClangToolChainInfo GetToolChainInfo()
+		{
+			return new SimplyStreamToolChainInfo(FileReference.FromString(ClangPath)!, FileReference.FromString(ArPath)!, Logger);
+		}
+
+		public override CppCompileEnvironment CreateSharedResponseFile(CppCompileEnvironment CompileEnvironment, FileReference OutResponseFile, IActionGraphBuilder Graph)
+		{
+			// Seems like Wasm clang toolchain does not handle response files including response files
+			return CompileEnvironment;
+		}
+
+		protected override FileItem GetCompileArguments_FileType(CppCompileEnvironment CompileEnvironment, FileItem SourceFile, DirectoryReference OutputDir, List<string> Arguments, Action CompileAction, CPPOutput CompileResult)
+		{
+			CompileAction.bCanExecuteRemotelyWithXGE = false;
+			CompileAction.bCanExecuteInUBA = false;
+			return base.GetCompileArguments_FileType(CompileEnvironment, SourceFile, OutputDir, Arguments, CompileAction, CompileResult);
+		}
+
+		protected override void GetCompileArguments_WarningsAndErrors(CppCompileEnvironment CompileEnvironment, List<string> Arguments)
+		{
+			base.GetCompileArguments_WarningsAndErrors(CompileEnvironment, Arguments);
+
+			// it seems like no other platform gets these, but there are a LOT
+			Arguments.Add("-Wno-shorten-64-to-32");
+
+			// Some metasound code is tripping this
+			Arguments.Add("-Wno-extra-qualification");
+
+			// Debug build tripped this
+			Arguments.Add("-Wno-ignored-attributes");
+
+
+			Arguments.Add("-Wno-vla-cxx-extension");
+
+			Arguments.Add("-Wno-deprecated-literal-operator");
+			Arguments.Add("-Wno-unused-result");
+			Arguments.Add("-Wno-unused-value");
+			Arguments.Add("-Wno-nontrivial-memcall");
+
+			// ClangToolchain adds some warning flags that are unknown, so just allow it
+			Arguments.Add("-Wno-unknown-warning-option");
+
+			Arguments.Add("-Wover-aligned");
+			Arguments.Add("-Wc++11-narrowing");
+			Arguments.Add("-Wno-missing-template-arg-list-after-template-kw");
+			Arguments.Add("-Wno-implicit-float-conversion");
+			Arguments.Add("-Wno-missing-braces");
+			Arguments.Add("-Wno-shadow");
+			Arguments.Add("-Wno-invalid-noreturn");
+			Arguments.Add("-Wno-reorder-ctor");
+			Arguments.Add("-Wno-implicit-int-conversion");
+			Arguments.Add("-Wno-float-conversion");
+			Arguments.Add("-Wno-invalid-constexpr");
+			// C++23 stricter Unicode code-unit rules flag u8 string literal -> TCHAR (char16_t)
+			// as ambiguous. UE source hits this extensively in Core/HTTP/etc.
+			Arguments.Add("-Wno-character-conversion");
+			// STOCK-EMSDK BRING-UP: stock clang 24 emits warnings their clang 23 did not.
+			Arguments.Add("-Wno-unused-template");
+			Arguments.Add("-Wno-error");
+		}
+
+		protected override void GetCppStandardCompileArgument(CppCompileEnvironment CompileEnvironment, List<string> Arguments)
+		{
+			Arguments.Add("-std=c++23");
+		}
+
+		protected override void GetCompileArguments_Global(CppCompileEnvironment CompileEnvironment, List<string> Arguments)
+		{
+			// wndr 5.8/wasm: a few stock engine headers contain CPU-specific inline asm that emscripten can't
+			// assemble and that a macro shim cannot intercept (e.g. UnrealMathNeon.h's FPCR mrs/msr, AtomicQueue.h's
+			// ARM isb). Emit build-time-patched shadow copies (ReplaceInline on the *current* engine source) into
+			// Intermediate and search them first, so engine source on disk stays byte-stock and auto-tracks updates.
+			DirectoryReference WasmShadowDir = GenerateWasmShadowHeaders();
+			// HAL/Platform.h is included relative to CoreTypes.h, so ordinary -iquote precedence
+			// cannot shadow it. Map that one stock path through clang's VFS overlay instead.
+			Arguments.Add("-ivfsoverlay");
+			Arguments.Add(string.Format("\"{0}\"", FileReference.Combine(WasmShadowDir, "SimplyStreamVfsOverlay.json").FullName.Replace("\\", "/")));
+			// The ThirdParty system-header shadow (AtomicQueue, <>-included) must resolve before the engine's own
+			// -isystem copy. clang searches -isystem dirs in command-line order, and the base emits the engine's
+			// SystemIncludePaths during the base call below — so add the shadow `sys` dir as -isystem *before*
+			// base, making it the first -isystem dir searched and thus the winner. (CppCompileEnvironment's
+			// SystemIncludePaths is an unordered HashSet, so we can't reorder it there.) Keeping it -isystem
+			// preserves the third-party header's pre-existing warning suppression (e.g. -Wundef on `#if _MSC_VER`).
+			// Windows host: quote + forward-slash the shadow path. emscripten's Python emcc driver parses its
+			// @response files with shell-style tokenization that consumes backslashes as escapes, so an UNQUOTED
+			// C:\...\sys -isystem path is mangled and the AtomicQueue/rtm <>-shadows silently lose to the real
+			// headers (AtomicQueue.h `isb` invalid-instruction + ACL VectorSet_W0). Forward slashes resolve for
+			// clang/emcc on every host and dodge the escape entirely; quoting also tolerates spaces. The -iquote
+			// shadows above never hit this because they were already quoted. (Linux FullName is already '/': no-op.)
+			Arguments.Add(string.Format("-isystem\"{0}\"", DirectoryReference.Combine(WasmShadowDir, "sys").FullName.Replace("\\", "/")));
+
+			base.GetCompileArguments_Global(CompileEnvironment, Arguments);
+
+			// Remap the original virtual NameTypes.h path so relative and include-path opens share one file identity.
+			Arguments.Add(string.Format("-ivfsoverlay\"{0}\"", FileReference.Combine(WasmShadowDir, "NameTypesVfsOverlay.yaml").FullName.Replace("\\", "/")));
+
+			Arguments.Add(string.Format("-iquote\"{0}\"", WasmShadowDir.FullName.Replace("\\", "/"))); // for "..." includes (UnrealMathNeon); forward-slash for Windows-host emcc (see -isystem note)
+
+			// wndr 5.8/wasm: -Wpass-failed is an *optimizer remark* ("the optimizer couldn't perform an optional
+			// transformation", e.g. it can't auto-vectorize AES.cpp's already-NEON AesEncryptArmHW loop) — never a code
+			// defect, and not suppressible via #pragma clang loop (it's the optimizer's own analysis report, not a
+			// pragma-driven request). Downgrade it from error to a (still-visible) warning so it doesn't fail the build.
+			Arguments.Add("-Wno-error=pass-failed");
+
+			Arguments.Add("-sDISABLE_EXCEPTION_CATCHING=1");
+			Arguments.Add("-sDISABLE_EXCEPTION_THROWING=1");
+			Arguments.Add("-fno-rtti");
+			Arguments.Add("-fno-exceptions");
+			// wndr 5.8/wasm: longjmp stays OFF (emscripten longjmp instruments code and hurts perf). If the app aborts
+			// with "missing function: setjmp", find and eliminate the setjmp caller (e.g. configure the offending
+			// ThirdParty lib without setjmp) rather than enabling -sSUPPORT_LONGJMP.
+			Arguments.Add("-sSUPPORT_LONGJMP=0");
+			//Arguments.Add("-fwasm-exceptions");
+
+			Arguments.Add("-fno-strict-aliasing");
+			//Arguments.Add("-fno-builtin");
+			// Replace all usage of Result with Arguments.Add
+			if (useUBsan && useAsan && useLsan)
+			{
+				Arguments.Add("-fsanitize=address,undefined,leak");
+			}
+			else if(useUBsan && useAsan)
+			{
+				Arguments.Add("-fsanitize=address,undefined");
+			}
+			else if (useAsan && useLsan)
+			{
+				Arguments.Add("-fsanitize=address,leak");
+			}
+			else if (useUBsan)
+			{
+				Arguments.Add("-fsanitize=undefined");
+			}
+			else if (useAsan)
+			{
+				Arguments.Add("-fsanitize=address");
+			}
+			else if (useLsan)
+			{
+				Arguments.Add("-fsanitize=leak");
+			}
+
+			Arguments.Add("-Dstrncpy=strncpy2");
+			//Arguments.Add("-DFORCE_USE_STATS=UE_BUILD_TEST");
+			Arguments.Add(IsMemory32 ? "-DUE_ARCH_NAME=wasm32" : "-DUE_ARCH_NAME=wasm64");
+			Arguments.Add(IsMemory32 ? "-DSIMPLYSTREAM_MEMORY32=1" : "-DSIMPLYSTREAM_MEMORY32=0");
+			Arguments.Add(IsMemory32 ? "-DSIMPLYSTREAM_POINTER_BITS=32" : "-DSIMPLYSTREAM_POINTER_BITS=64");
+			if (IsMemory32)
+			{
+				// Shadow contents are generated behind stable file names that UBT does not track as
+				// source prerequisites. Bump this epoch for each wasm32 compatibility slice so no
+				// object compiled against an older pointer layout can survive incrementally.
+				Arguments.Add($"-DSIMPLYSTREAM_MEMORY32_COMPAT_EPOCH={Memory32CompatibilityEpoch}");
+			}
+			Arguments.Add($"-DPLATFORM_WASM_ENABLE_ANTIALIAS={enableAA}");
+
+			//Arguments.Add("-DEIGEN_DONT_VECTORIZE");
+
+			if (enableDebug == true)
+			{
+				//Result += " -gline-tables-only";
+				if (enableDwarf5 == true)
+				{
+					Arguments.Add("-gsplit-dwarf");
+					Arguments.Add("-gdwarf-5");
+				}
+				else
+				{
+					Arguments.Add("-g");
+				}
+			}
+
+			// Keep the non-LTO code-size passes in Development so fleet dev ships exercise the same
+			// symbol visibility and function merging behavior used by Shipping.
+			if (CompileEnvironment.Configuration == CppConfiguration.Development ||
+				CompileEnvironment.Configuration == CppConfiguration.Shipping)
+			{
+				Arguments.Add("-fvisibility=hidden");
+				Arguments.Add("-fvisibility-inlines-hidden");
+				Arguments.Add("-Xclang -fmerge-functions");
+			}
+
+			if (CompileEnvironment.Configuration == CppConfiguration.Shipping)
+			{
+				Arguments.Add("-O3");
+				//Arguments.Add("-mllvm -inline-threshold=2000");
+				Arguments.Add("-ffunction-sections");
+				Arguments.Add("-fdata-sections");
+				//Arguments.Add("-fno-PIE");
+				//Arguments.Add("-fno-unroll-loops"); // test for safety first
+
+				if (ltoMode.Equals("thin", StringComparison.InvariantCultureIgnoreCase) && !maximumOptimizations)
+				{
+					Arguments.Add("-flto=thin");
+				}
+				else if (ltoMode.Equals("full", StringComparison.InvariantCultureIgnoreCase) || maximumOptimizations)
+				{
+					Arguments.Add("-flto=full");
+					Arguments.Add("-fwhole-program-vtables");
+					// Some protected runtime modules are finalized with -fno-lto below. VFE cannot see
+					// their vtable uses and removed live startup targets in Shipping revision 284.
+					Arguments.Add("-fforce-emit-vtables");
+				}
+			} else
+			{
+				Arguments.Add("-Os");
+			}
+
+			if (enableTracing)
+			{
+				Arguments.Add("--tracing");
+			}
+			//PrintOnce(Configuration, bOptimizeForSize, bUseInlining);
+
+			if (enableSIMD)
+			{
+				Arguments.Add("-Wno-c++11-narrowing");
+				Arguments.Add("-msimd128");
+				// wndr 5.8: ARM/NEON family on wasm. emscripten maps NEON intrinsics (arm_neon.h, used by
+				// UnrealMathNeon) to wasm-simd128 under -msimd128. Do NOT pass -msse* — those select the x86
+				// path, and 5.8's real-x86-only code (cpuid asm / AES-NI / MXCSR) can't build under emscripten.
+				Arguments.Add("-DSIMPLYSTREAM_SIMD=1");
+			} else
+			{
+				Arguments.Add("-DSIMPLYSTREAM_SIMD=0");
+			}
+			if (enableMultithreading)
+			{
+				Arguments.Add("-pthread");
+			} else
+			{
+				Arguments.Add("-DSIMPLTSTREAM_ENABLE_RENDERER_THREAD=0");
+			}
+
+			Environment.SetEnvironmentVariable("EMCC_SKIP_SANITY_CHECK", "1");
+
+			//Arguments.Add("-v"; // useful for path hunting issues
+
+			if (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Linux)
+			{
+				// Packaging on Linux needs this - or else system clang will be attempted to be picked up instead of UE4's included emsdk
+				Environment.SetEnvironmentVariable(SimplyStreamSDKInfo.PLATFORM_USER_HOME, SimplyStreamSDKInfo.SimplyStreamIntermediatory);
+			}
+			if (BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Win64)
+			{
+				// Packaging on Window needs this - zap any existing HOME environment variables to prevent any accidental pick ups
+				Environment.SetEnvironmentVariable("HOME", "");
+			}
+
+			Arguments.Add($"-sMEMORY64={Memory64Setting}");
+			Arguments.Add($"-DMEMORY64={Memory64Setting}");
+
+			//Arguments.Add("-fpic";
+			// alignment fault, get working later
+			//Arguments.Add("-DWITH_RHI_BREADCRUMBS=0");
+		}
+
+		protected override void GetCompileArguments_Optimizations(CppCompileEnvironment CompileEnvironment, List<string> Arguments)
+		{
+			base.GetCompileArguments_Optimizations(CompileEnvironment, Arguments);
+
+			//// Profile Guided Optimization (PGO) and Link Time Optimization (LTO)
+			//if (CompileEnvironment.bPGOOptimize)
+			//{
+			//	// Always enable LTO when using PGO.
+			//	Arguments.Add("-flto=thin");
+			//}
+			//else if (CompileEnvironment.bPGOProfile)
+			//{
+			//	// Always enable LTO when generating PGO profile data.
+			//	Arguments.Add("-flto=thin");
+			//}
+			//else if (CompileEnvironment.bAllowLTCG && CompileEnvironment.Configuration == CppConfiguration.Shipping)
+			//{
+			//	// When not using PGO, enable LTO in shipping builds if opted-in by the build configuration.
+			//	Arguments.Add("-flto=thin");
+			//}
+			/*
+			if (CompileEnvironment.bOptimizeCode)
+			{
+				if (CompileEnvironment.OptimizationLevel == OptimizationMode.Size)
+				{
+					Arguments.Add("-Oz");
+				}
+				else if (CompileEnvironment.OptimizationLevel == OptimizationMode.SizeAndSpeed)
+				{
+					Arguments.Add("-Os");
+				}
+				else
+				{
+					Arguments.Add("-O3");
+				}
+			}
+			else
+			{
+				Arguments.Add("-O0");
+			}
+			*/
+			//if (CompileEnvironment.bRetainFramePointers)
+			//{
+			//	Arguments.Add("-fno-omit-frame-pointer");
+			//}
+			//else
+			//{
+			//	Arguments.Add("-fomit-frame-pointer");
+			//}
+		}
+		string GetLinkArguments(LinkEnvironment LinkEnvironment)
+		{
+			string Result = "";
+			Result += " -sDISABLE_DEPRECATED_FIND_EVENT_TARGET_BEHAVIOR=1";
+			Result += " -sTEXTDECODER=1";
+
+
+			if (useUBsan && useAsan)
+			{
+				Result += " -fsanitize=address,undefined -DFORCE_ANSI_ALLOCATOR=1 -fno-omit-frame-pointer";
+			}
+			else if (useUBsan && useLsan)
+			{
+				Result += " -fsanitize=undefined,leak";
+			}
+			else if (useUBsan)
+			{
+				Result += " -fsanitize=undefined";
+			}
+			else if (useAsan)
+			{
+				Result += " -fsanitize=address -DFORCE_ANSI_ALLOCATOR=1 -fno-omit-frame-pointer";
+			}
+			else if (useLsan)
+			{
+				Result += " -fsanitize=leak";
+			}
+
+			Result += " -sEVAL_CTORS=0"; // should likely by 1 when EVAL_CTORS supports threads
+
+			Result += " -Wl,--gc-sections";
+
+			if (!LinkEnvironment.bCreateDebugInfo || (maximumOptimizations && LinkEnvironment.Configuration == CppConfiguration.Shipping))
+			{
+				Result += " -Wl,--strip-debug";
+			}
+
+			if (LinkEnvironment.bPGOOptimize)
+			{
+				//
+				// Clang emits warnings for each compiled object file that doesn't have a matching entry in the profile data.
+				// This can happen when the profile data is older than the binaries we're compiling.
+				//
+				// Disable these warnings. They are far too verbose.
+				//
+				Result += " -Wno-profile-instr-out-of-date";
+				Result += " -Wno-profile-instr-unprofiled";
+
+				Result += String.Format(" -fprofile-use=\"{0}.profdata\"", Path.Combine(LinkEnvironment.PGODirectory!, LinkEnvironment.PGOFilenamePrefix!).Replace("\\", "/"));
+			}
+			else if (LinkEnvironment.bPGOProfile)
+			{
+				// Android supports only LLVM IR-based for instrumentation-based PGO.
+				Result += " -fprofile-generate";
+				//  for sampling-based profile collection to generate minimal debug information:
+				Result += " -gline-tables-only";
+			}
+
+			//Result += " -Wl,-no-pie";
+			if (LinkEnvironment.Configuration == CppConfiguration.Debug || LinkEnvironment.Configuration == CppConfiguration.Development)
+			{
+				Result += " -sSTACK_OVERFLOW_CHECK=1"; // 2 requires binayen opts which we can't use with dwarf5
+				Result += " -sASSERTIONS=1";
+				Result += " -sGL_ASSERTIONS=0";
+				Result += " -sGL_DEBUG=0";
+				Result += " -O1";
+			}
+			else
+			{
+				if (maximumOptimizations)
+				{
+					Result += " -Wl,-O3";
+					// NOTE: no --icf here — wasm-ld has no ICF support (ELF/COFF LLD feature); passing
+					// -Wl,--icf=all hard-fails every Shipping link ("unknown argument"). LTO + mergefunc
+					// below cover the same ground.
+					Result += " -O3";
+					Result += " -mllvm -passes=mergefunc";
+					//Result += " -mno-bulk-memory-opt -mno-bulk-memory";
+				}
+				else
+				{
+					//Result += " --profiling-funcs";
+					Result += " -O1";
+				}
+				//js code needs to be properly written to supporty the closure compiler, look here for a possible perf gain. https://developers.google.com/closure/compiler/docs/api-tutorial3
+				//Result += " --closure 1";
+				//Result += " --profiling-funcs";
+			}
+
+			if (enableDebug == true)
+			{
+				//Result += " -gline-tables-only";
+				if (enableDwarf5 == true)
+				{
+					Result += " -gdwarf-5";
+					Result += " -sERROR_ON_WASM_CHANGES_AFTER_LINK";
+				}
+				else
+				{
+					Result += " -g";
+				}
+				Result += " -gseparate-dwarf=" + SimplyStreamSDKInfo.DebugUUID + ".debug.wasm";
+				Result += " -sSEPARATE_DWARF_URL=http://127.0.0.1/" + SimplyStreamSDKInfo.DebugUUID + ".debug.wasm";
+				//Result += " -sSEPARATE_DWARF_URL=file://" + SimplyStreamSDKInfo.DebugUUID + ".debug.wasm";
+				Result += " -sREVERSE_DEPS=all";
+			}
+
+			if (profilerMode.Equals("cpu", StringComparison.InvariantCultureIgnoreCase))
+			{
+				Result += " --cpuprofiler";
+			}
+			else if (profilerMode.Equals("memory", StringComparison.InvariantCultureIgnoreCase))
+			{
+				// wndr-note: USE_OFFSET_CONVERTER was removed in emscripten 5.0
+				// (the wasm offset converter is gone). Memory profiler still works
+				// without it; __builtin_return_address callers need a different
+				// strategy on 5.x.
+				Result += " -sMALLOC=dlmalloc --memoryprofiler";
+			}
+			else if (profilerMode.Equals("thread", StringComparison.InvariantCultureIgnoreCase))
+			{
+				if (enableMultithreading)
+				{
+					Result += " --threadprofiler";
+				}
+			}
+
+
+			if (enableShippingAssertions)
+			{
+				Result += " -sWARN_UNALIGNED=1";
+				Result += " -sASSERTIONS=1"; // 2 can increase function calls 2x?
+				//Result += " -sGL_ASSERTIONS";
+				if (enableDebug)
+				{
+					Result += " -sSTACK_OVERFLOW_CHECK=1";
+				}
+				else
+				{
+					// Level 2 instruments every wasm function and taxes both binary size and runtime. Shipping still
+					// keeps Emscripten's low-cost stack-boundary check without carrying per-function instrumentation.
+					Result += " -sSTACK_OVERFLOW_CHECK=1";
+				}
+			}
+
+			if (enableSAFE_HEAP && (LinkEnvironment.Configuration == CppConfiguration.Debug || LinkEnvironment.Configuration == CppConfiguration.Development))
+			{
+				Result += " -sSAFE_HEAP=1"; //2 for wasm only
+				//Result += " -sSAFE_HEAP_LOG=1";
+			}
+
+			if (enableShippingAssertions || useUBsan || useAsan || useLsan || enableSAFE_HEAP)
+			{
+				Result += " --profiling-funcs";
+			}
+
+			if (useUBsan || useAsan || useLsan)
+			{
+				Result += " -fsanitize-recover=all";
+			}
+
+			if (enableTracing)
+			{
+				Result += " --tracing";
+			}
+			if (LinkEnvironment.Configuration == CppConfiguration.Shipping)
+			{
+				// wndr (names-on-server): preserve function names in a private function-index map without
+				// --profiling-funcs, which would put the same names back into the shipped wasm. AutomationTool
+				// rejects deployment if this map is absent or name/debug metadata survives the strip flags.
+				Result += " --emit-symbol-map";
+				if (ltoMode.Equals("thin", StringComparison.InvariantCultureIgnoreCase) && !maximumOptimizations)
+				{
+					Result += " -flto=thin";
+					Result += " --thinlto-cache-dir=./thinlto_cache";
+					Result += " -Wl,--lto-O3";
+				}
+				else if (ltoMode.Equals("full", StringComparison.InvariantCultureIgnoreCase) || maximumOptimizations) // determine if this is a net win, if not then dont enable it with maximumOptimizations
+				{
+					Result += " -flto";
+					Result += " -Wl,--lto-O3";
+				}
+				Result += " --strip-debug --strip-dwarf --strip-producers";
+				Result += " --merge-similar-functions --duplicate-function-elimination --inlining-optimizing --once-reduction";
+			}
+			Result += " -sINITIAL_MEMORY=" + initialMemoryMB + "MB";
+			Result += " -sTOTAL_MEMORY=" + initialMemoryMB + "MB";
+
+			if (enableMultithreading)
+			{
+				//reserve this many threads.
+				// wndr 2026-06-21: UE spawns a FIXED ~25-30 pthreads (game/render/RHI, audio x2, file-IO x2, IO
+				// dispatcher, async loading, message router, media ticker, HTTP, online, output-redirector,
+				// GIOThreadPool 2-4, LowLevelTasks workers 4, queued pools, ...) — this count is NOT core-bound
+				// (NumberOf*WorkerThreadsToSpawn cap at 2-4). With the old pool=8 / =num_logical_cores, the pool was
+				// exceeded and overflow threads were created ON-DEMAND (STRICT=0). On-demand creation needs the main
+				// thread to instantiate each Worker; under render load that stalls, so a thread that must service
+				// work queued to GIOThreadPool (e.g. FShaderCodeArchive shader-code reads during the instanced base
+				// pass) never actually starts -> FShaderCodeArchive::WaitForPreload never completes -> the render
+				// thread + RDG workers deadlock (game thread then blocks in FlushRenderingCommands). Pre-create a
+				// pool that comfortably covers UE's whole thread set so no critical thread is on-demand. Net memory
+				// is ~unchanged (these threads get created either way; DELAY_LOAD keeps startup non-blocking).
+				if (mt_lowthreads)
+				{
+					Result += " -sPTHREAD_POOL_SIZE=32";
+				} else
+				{
+					Result += " -sPTHREAD_POOL_SIZE=48";
+				}
+
+				//0 == allow more threads at runtime
+				//1 == warning if thread pool is exhausted (default)
+				//2 == error if thread pool is exhausted
+				//why 0 is chosen == create more threads when they are needed
+				Result += " -sPTHREAD_POOL_SIZE_STRICT=0";
+
+				//0 == wait on thread pool before starting main (default)
+				//1 == do not wait on thread pool
+				//why 1 is chosen == faster startup time
+				Result += " -sPTHREAD_POOL_DELAY_LOAD=1";
+
+				//1 is default
+				//Result += " -sALLOW_BLOCKING_ON_MAIN_THREAD=0";
+			}
+
+			Result += " -sUSE_WEBGPU=0";
+
+			if (enableMultithreading)
+			{
+				//Result += " -sPROXY_TO_PTHREAD";
+				//Result += " -sUSE_PTHREADS=1";
+				Result += " -pthread";
+						if (!LinkEnvironment.OutputFilePath.GetFileName().Contains("Server")/* && !buildForNode*/)
+						{
+							Result += " -sOFFSCREENCANVAS_SUPPORT=1"; // -s OFFSCREENCANVASES_TO_PTHREAD='#canvas' -s OFFSCREEN_FRAMEBUFFER=1
+						}
+			}
+
+			// The HTML page template precreates the WebGL context, so instruct the runtime to hook into that if available.
+			Result += " -sGL_PREINITIALIZED_CONTEXT=1";
+
+			Result += " -sEXPORTED_RUNTIME_METHODS=\"['UTF8ToString', 'ccall']\"";
+			Result += " -sEXPORTED_FUNCTIONS=\"['_free', '_malloc', '__emscripten_thread_crashed', '_emscripten_proxy_execute_queue', '_emscripten_proxy_finish', '_main', '_on_fatal', '_emscripten_is_main_browser_thread', '_emscripten_webgl_make_context_current', '_memset', '_ntohs', '_htons']\"";
+			//Result += " -s NO_EXIT_RUNTIME=1";
+
+			//Result += " -sSAFE_HEAP=1"; //2 for wasm only
+
+			//Result += " --profiling-funcs";
+			//Result += " -g";
+
+			Result += " -v";
+			//Result += " -s LLD_REPORT_UNDEFINED";
+			//Result += " -s CASE_INSENSITIVE_FS=1";
+			//Result += " -s FORCE_FILESYSTEM=1";
+			//Result += " -s FILESYSTEM=0"; //would be nice but needs work
+			//var stack_size = 5;
+
+			//Result += " -s TOTAL_STACK=" + stack_size + "MB";
+			Result += " -sSTACK_SIZE=2MB";
+			Result += " -sDEFAULT_PTHREAD_STACK_SIZE=1MB";
+			Result += " -sWASM_BIGINT";
+			Result += " -sFETCH=1";
+			//Result += " -sDYNCALLS=1";
+			//Result += " --proxy-to-worker";
+			//Result += " -lidbfs.js";
+			//Result += " -lpthread.js";
+			Result += " -lhtml5_webgl.js";
+			// STOCK-EMSDK BRING-UP: link driver runs in C mode; force C++ so emcc auto-links the
+			// correct noexcept/mt/memory64 libc++ variant. Without this stock emcc 6.x links NO libc++.
+			Result += " -sDEFAULT_TO_CXX";
+			//Result += " -s LZ4=1";
+			Result += " -lwebsocket.js";
+			// wndr 5.8/wasm: setjmp/longjmp shim. We keep -sSUPPORT_LONGJMP=0 (instrumented longjmp hurts perf); this
+			// js-library resolves the setjmp/longjmp imports that stock engine code (PngImageWrapper libpng error
+			// handling, JPEG/FreeType) pulls in — setjmp()->0 (happy path) / longjmp()->abort. Without it the app aborts
+			// at startup with "missing function: setjmp" the first time a PNG/etc. is decoded.
+			Result += " --js-library \"" + Directory.GetCurrentDirectory() + "/../Platforms/SimplyStream/Source/Runtime/Core/Private/SimplyStreamSetjmpShim.js\"";
+			// wndr 5.8/wasm: getaddrinfo MEMORY64 fix. Passed AFTER the stock library so this definition wins (same
+			// override mechanism as the setjmp shim). Stock emscripten getaddrinfo stores a JS null/string into the
+			// ai_canonname POINTER field; under -sMEMORY64+-sWASM_BIGINT that becomes BigInt(null) which throws and
+			// crashes the wasm the moment UE netcode resolves a server hostname (MP join). See the shim's header.
+			Result += " --js-library \"" + Directory.GetCurrentDirectory() + "/../Platforms/SimplyStream/Source/Runtime/Sockets/Private/SimplyStreamGetaddrinfoShim.js\"";
+			Result += " --shell-file \"" + Directory.GetCurrentDirectory() + "/../Platforms/SimplyStream/simplystream.html\"";
+			if (LinkEnvironment.OutputFilePath.GetFileName().Contains("Server") || buildForNode)
+			{
+				//Result += " -sENVIRONMENT=node";
+				//Result += " --extern-pre-js \"" + Directory.GetCurrentDirectory() + "/../Platforms/SimplyStream/shell2_server.js\"";
+			}
+			else
+			{
+				Result += " -sENVIRONMENT=web,worker";
+			}
+			Result += " --pre-js \"" + Directory.GetCurrentDirectory() + "/../Platforms/SimplyStream/simplystream.js\"";
+			//Result += " --bind";
+
+			if (LinkEnvironment.bIsBuildingDLL)
+			{
+				//Result += " -s SIDE_MODULE=2";
+				//Console.WriteLine("Compiling side module");
+			}
+			else
+			{
+				//Result += " -s MAIN_MODULE=2";
+				//Console.WriteLine("Compiling main module");
+			}
+			//Result += " -Wl,--fatal-warnings";
+
+			//Result += " --closure 1";
+			//Result += " -s IGNORE_CLOSURE_COMPILER_ERRORS=1";
+			//enable after closure compiler works
+			//Result += " -sSUPPORT_ERRNO=0";
+			Result += " -sFETCH_SUPPORT_INDEXEDDB=0";
+
+			//Result += " -s SUPPORT_LONGJMP=1";
+			//Console.WriteLine("Using closure compiler");
+			Result += " -sERROR_ON_UNDEFINED_SYMBOLS=0";
+
+			Result += $" -sMEMORY64={Memory64Setting}";
+
+			{
+				Result += " -sUSE_VORBIS";
+				Result += " -sUSE_ZLIB";
+				Result += " -sUSE_OGG";
+				//Result += " -sUSE_LIBPNG";
+				//Result += " -sUSE_HARFBUZZ";
+				//Result += " -sUSE_ICU";
+				//Result += " -sUSE_FREETYPE";
+			}
+
+			if (!profilerMode.Equals("memory", StringComparison.InvariantCultureIgnoreCase))
+			{
+				//Result += " -sMALLOC=emmalloc mimalloc.o";
+				// wndr-note: USE_OFFSET_CONVERTER was removed in emscripten 5.0;
+				// the setting no longer exists so passing =0 errors. Default
+				// behaviour on 5.x is what the =0 path used to ask for.
+			}
+
+			return Result;
+		}
+
+		static string GetLibArguments(LinkEnvironment LinkEnvironment)
+		{
+			string Result = "";
+
+			return Result;
+		}
+
+		// wndr 5.8/wasm: build-time shadow-patching of stock engine headers (see GetCompileArguments_Global).
+		// We copy the *current* engine header into an Intermediate shadow dir, ReplaceInline the inline-asm
+		// that emscripten can't build, and -iquote that dir so it resolves before the real header. No engine
+		// source on disk is modified, and the patch is regenerated from the live source each build.
+		static bool bWasmShadowHeadersGenerated = false;
+		DirectoryReference GenerateWasmShadowHeaders()
+		{
+			DirectoryReference ShadowDir = DirectoryReference.Combine(Unreal.EngineDirectory, "Intermediate", "Build", "SimplyStream", $"ShadowIncludeMemory32Epoch{Memory32CompatibilityEpoch}");
+			if (bWasmShadowHeadersGenerated)
+			{
+				return ShadowDir;
+			}
+			// UnrealMathNeon.h ("Math/..."): VectorGet/SetControlRegister read/write the ARM FPCR via inline asm
+			// (mrs/msr), called unconditionally by FScopedFTZFloatMode. wasm has no FPCR -> neutralize (get->0,
+			// set->no-op); the NEON math path then compiles and FTZ becomes a harmless no-op.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Math/UnrealMathNeon.h", "Math/UnrealMathNeon.h", new Dictionary<string, string>
+			{
+				{ "__asm__ volatile(\"mrs %0, fpcr\" : \"=r\"(Value));", "Value = 0; /* wndr wasm: no FPCR */" },
+				{ "__asm__ volatile(\"msr fpcr, %0\" : : \"r\"(State64));", "(void)State64; /* wndr wasm: no FPCR */" },
+			});
+			// AtomicQueue.h (ThirdParty, <>-included): spin-yield uses the ARM `isb` inline asm under
+			// PLATFORM_CPU_ARM_FAMILY, which emscripten can't assemble; wasm has no pause/yield -> no-op.
+			ShadowPatch(ShadowDir, true, "ThirdParty/AtomicQueue/AtomicQueue.h", "AtomicQueue.h", new Dictionary<string, string>
+			{
+				{ "__asm__ __volatile__(\"isb\");", "((void)0); /* wndr wasm: no ARM isb */" },
+			});
+			// Crc.cpp: MemCrc32ArmHW uses ARM __builtin_arm_crc32b/d under `#if defined(__clang__) && PLATFORM_CPU_ARM_FAMILY`.
+			// It's compiled but never selected on wasm (DETECT_HW_CRC32_SUPPORT_IN_RUNTIME==0 and __ARM_FEATURE_CRYPTO is
+			// undefined), so force the guard off; the portable table-based FCrc::MemCrc32Func is used instead (identical CRC
+			// values). Forcing it off (rather than stubbing the builtins) also avoids an unused-static-function error.
+			// Although it's a .cpp, UE's unity blobs pull it in via a quoted, include-path-relative #include
+			// ("Runtime/Core/Private/Misc/Crc.cpp"), so the -iquote header shadow resolves it before the engine copy.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/Misc/Crc.cpp", "Runtime/Core/Private/Misc/Crc.cpp", new Dictionary<string, string>
+			{
+				{ "#if defined(__clang__) && PLATFORM_CPU_ARM_FAMILY", "#if defined(__clang__) && PLATFORM_CPU_ARM_FAMILY && !defined(__EMSCRIPTEN__)" },
+			});
+			// RigLogic trimd/Platform.h (included as "trimd/Platform.h"): with TRIMD_PLATFORM_ARM forced on (see the
+			// compat shim), trimd takes its ARM/NEON path, but its ARM getCPUFeatures() uses getauxval(AT_HWCAP) which
+			// emscripten lacks. Add an emscripten branch that reports NEON (wasm-simd128 provides NEON via SIMDe) so
+			// RigLogic selects its NEON specialization (trimd::neon) — NO scalar fallback.
+			ShadowPatch(ShadowDir, false, "../Plugins/Animation/RigLogic/Source/RigLogicLib/Public/trimd/Platform.h", "trimd/Platform.h", new Dictionary<string, string>
+			{
+				// (a) platform-includes block: skip the Linux <sys/auxv.h> CPU-feature include on emscripten.
+				{ "#include \"trimd/PlatformWindows.h\"\n        #else\n            #include <sys/auxv.h>", "#include \"trimd/PlatformWindows.h\"\n        #elif defined(__EMSCRIPTEN__)\n            /* wndr wasm: NEON via SIMDe; no CPU-feature detection includes */\n        #else\n            #include <sys/auxv.h>" },
+				// (b) getCPUFeatures block: report NEON (wasm-simd128 provides it via SIMDe) instead of the getauxval path.
+				{ "        #else\n            #ifdef __arm__\n                // ARM-32bit", "        #elif defined(__EMSCRIPTEN__)\ninline CPUFeatures getCPUFeatures() {\n    CPUFeatures flags = {};\n    flags.NEON = true;  /* wndr wasm: wasm-simd128 provides NEON via SIMDe */\n    flags.FP16 = true;\n    return flags;\n}\n        #else\n            #ifdef __arm__\n                // ARM-32bit" },
+			});
+			// HairStrandsVertexFactory.h: clang rejects specializing StaticType (via IMPLEMENT_TEMPLATE_VERTEX_FACTORY_TYPE
+			// in the .cpp) after it was implicitly instantiated. In a unity build, GroomAsset.cpp (bundled earlier in the
+			// SAME TU) takes &FHairStrandsVertexFactory::StaticType, implicitly instantiating it before the .cpp
+			// specializes it. Fix by declaring the explicit specializations in the header so nobody implicitly
+			// instantiates. (MSVC tolerates this; clang does not.) No SIMD involved. Use a WRAPPER shadow that #includes
+			// the real header (deduped with it by #pragma-once file-identity, avoiding a redefinition) then appends the
+			// declarations — a copied shadow would be a distinct file and double-define the class.
+			ShadowWrap(ShadowDir, false, "../Plugins/Runtime/HairStrands/Source/HairStrandsCore/Public/HairStrandsVertexFactory.h", "HairStrandsVertexFactory.h",
+				"template<> FVertexFactoryType FHairStrandsVertexFactory::StaticType;\ntemplate<> FVertexFactoryType FLinearSweptSpheresHairStrandsVertexFactory::StaticType;\n");
+			// ACL/RTM rtm/math.h (pulled in via <rtm/quatf.h> -> "rtm/math.h"): emscripten defines __SSE2__ (under
+			// -msimd128), so RTM auto-selects its SSE2 impl (rtm::vector4f == __m128) while UE forces NEON
+			// (VectorRegister4f == float32x4_t) — the two SIMDe families don't interconvert, so ACL's
+			// `Rotation = rtm_quat` / `VectorSet_W0(rtm_vec)` fail. Force RTM to NEON on emscripten so its types match
+			// UE's (both float32x4_t). No scalar fallback — keeps ACL vectorized.
+			// bSystem:true -> served via -isystem (the shadow `sys` dir is the FIRST -isystem, added before base), so it
+			// wins over the real rtm/math.h for BOTH quoted ("rtm/math.h") and angle (<rtm/math.h>) includes regardless
+			// of include order. (With -iquote it worked in isolation but lost in the full TU when something reached the
+			// real header first; the shadow's detection is guarded by `#if !defined(RTM_NO_INTRINSICS)` and got skipped.)
+			ShadowPatch(ShadowDir, true, "../Plugins/Animation/ACLPlugin/Source/ThirdParty/acl/external/rtm/includes/rtm/math.h", "rtm/math.h", new Dictionary<string, string>
+			{
+				{ "#elif defined(__SSE2__) || defined(RTM_ARCH_X86) || defined(RTM_ARCH_X64)", "#elif (defined(__SSE2__) || defined(RTM_ARCH_X86) || defined(RTM_ARCH_X64)) && !defined(__EMSCRIPTEN__)" },
+				{ "#elif defined(RTM_ARCH_ARM)", "#elif defined(RTM_ARCH_ARM) || defined(__EMSCRIPTEN__)" },
+			});
+			// AES.cpp: at -O3 the loop vectorizer can't further auto-vectorize the already-NEON ARM AES routines and
+			// emits -Wpass-failed (an optimizer remark, not a code defect; the failing loop is in inlined AES code so a
+			// per-loop pragma can't pin it). Wrap the two `target("aes")` blocks in a diagnostic-ignored region so the
+			// remark is silenced for *just* those AES functions; -Wpass-failed stays active everywhere else.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/Misc/AES.cpp", "Runtime/Core/Private/Misc/AES.cpp", new Dictionary<string, string>
+			{
+				{ "#pragma clang attribute push (__attribute__((target(\"aes\"))), apply_to=function)", "#pragma clang attribute push (__attribute__((target(\"aes\"))), apply_to=function)\n#pragma clang diagnostic push\n#pragma clang diagnostic ignored \"-Wpass-failed\"" },
+				{ "#pragma clang attribute pop", "#pragma clang diagnostic pop\n#pragma clang attribute pop" },
+			});
+			// NameTypes.h: FLazyName stores either a pointer or a packed uint64 in the same union. With a native
+			// wasm32 pointer, the stock literal constructors initialize only the low four bytes; their by-value ABI
+			// then copies all eight union bytes, and Resolve() can mistake indeterminate high bits for IsNameFlag.
+			// Zero the full union before activating the pointer member. Keep the stock initializer for MEMORY64=1/2.
+			DirectoryReference NameTypesVfsDir = DirectoryReference.Combine(ShadowDir, "vfs");
+			ShadowPatch(NameTypesVfsDir, false, "Runtime/Core/Public/UObject/NameTypes.h", "NameTypes.h", new Dictionary<string, string>
+			{
+				{
+					": Either{.AnsiLiteral = Literal}\n\t\t, Number(ParseNumber(Literal, N - 1))\n\t\t, LiteralType(ELiteralType::AnsiLiteral)\n\t{\n\t}",
+					"#if defined(__EMSCRIPTEN__) && MEMORY64 == 0\n\t\t: Either{.PackedName = 0}\n#else\n\t\t: Either{.AnsiLiteral = Literal}\n#endif\n\t\t, Number(ParseNumber(Literal, N - 1))\n\t\t, LiteralType(ELiteralType::AnsiLiteral)\n\t{\n#if defined(__EMSCRIPTEN__) && MEMORY64 == 0\n\t\tEither.AnsiLiteral = Literal;\n#endif\n\t}"
+				},
+				{
+					": Either{.Utf8Literal = Literal}\n\t\t, Number(ParseNumber(Literal, N - 1))\n\t\t, LiteralType(ELiteralType::Utf8Literal)\n\t{\n\t}",
+					"#if defined(__EMSCRIPTEN__) && MEMORY64 == 0\n\t\t: Either{.PackedName = 0}\n#else\n\t\t: Either{.Utf8Literal = Literal}\n#endif\n\t\t, Number(ParseNumber(Literal, N - 1))\n\t\t, LiteralType(ELiteralType::Utf8Literal)\n\t{\n#if defined(__EMSCRIPTEN__) && MEMORY64 == 0\n\t\tEither.Utf8Literal = Literal;\n#endif\n\t}"
+				},
+				{
+					": Either{.WideLiteral = Literal}\n\t\t, Number(ParseNumber(Literal, N - 1))\n\t\t, LiteralType(ELiteralType::WideLiteral)\n\t{\n\t}",
+					"#if defined(__EMSCRIPTEN__) && MEMORY64 == 0\n\t\t: Either{.PackedName = 0}\n#else\n\t\t: Either{.WideLiteral = Literal}\n#endif\n\t\t, Number(ParseNumber(Literal, N - 1))\n\t\t, LiteralType(ELiteralType::WideLiteral)\n\t{\n#if defined(__EMSCRIPTEN__) && MEMORY64 == 0\n\t\tEither.WideLiteral = Literal;\n#endif\n\t}"
+				},
+			}, true);
+			FileReference NameTypesSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/UObject/NameTypes.h");
+			FileReference NameTypesShadow = FileReference.Combine(NameTypesVfsDir, "NameTypes.h");
+			FileReference NameTypesOverlay = FileReference.Combine(ShadowDir, "NameTypesVfsOverlay.yaml");
+			string NameTypesSourceDirectory = NameTypesSource.Directory.FullName.Replace("\\", "/").Replace("\"", "\\\"");
+			string NameTypesShadowPath = NameTypesShadow.FullName.Replace("\\", "/").Replace("\"", "\\\"");
+			string NameTypesOverlayText =
+				"{\n" +
+				"  \"version\": 0,\n" +
+				"  \"case-sensitive\": true,\n" +
+				"  \"use-external-names\": false,\n" +
+				"  \"roots\": [\n" +
+				"    {\n" +
+				"      \"type\": \"directory\",\n" +
+				"      \"name\": \"" + NameTypesSourceDirectory + "\",\n" +
+				"      \"contents\": [\n" +
+				"        {\n" +
+				"          \"type\": \"file\",\n" +
+				"          \"name\": \"NameTypes.h\",\n" +
+				"          \"external-contents\": \"" + NameTypesShadowPath + "\"\n" +
+				"        }\n" +
+				"      ]\n" +
+				"    }\n" +
+				"  ]\n" +
+				"}\n";
+			if (!FileReference.Exists(NameTypesOverlay) || File.ReadAllText(NameTypesOverlay.FullName) != NameTypesOverlayText)
+			{
+				File.WriteAllText(NameTypesOverlay.FullName, NameTypesOverlayText);
+			}
+			// UE 5.8 removed 32-bit platform support and hard-errors if a platform defines the legacy
+			// width macros. Native wasm32 still needs truthful values because pointer-sized engine code
+			// and diagnostics consult them. Keep stock behavior for the rollback ABIs and change only
+			// explicitly selected Memory32 builds.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/HAL/Platform.h", "HAL/Platform.h", new Dictionary<string, string>
+			{
+				{
+					"#ifdef PLATFORM_32BITS\n\t#error PLATFORM_32BITS should not be defined.\n#endif\n#ifdef PLATFORM_64BITS\n\t#error PLATFORM_64BITS should not be defined.\n#endif\n#define PLATFORM_32BITS UE_DEPRECATED_MACRO(5.8, \"PLATFORM_32BITS is deprecated as UE only supports 64-bit.\") 0\n#define PLATFORM_64BITS UE_DEPRECATED_MACRO(5.8, \"PLATFORM_64BITS is deprecated as UE only supports 64-bit.\") 1",
+					"#if SIMPLYSTREAM_MEMORY32\n#define PLATFORM_32BITS UE_DEPRECATED_MACRO(5.8, \"PLATFORM_32BITS is deprecated.\") 1\n#define PLATFORM_64BITS UE_DEPRECATED_MACRO(5.8, \"PLATFORM_64BITS is deprecated.\") 0\n#if defined(__cplusplus)\nstatic_assert(sizeof(void*) == 4, \"SimplyStream Memory32 requires four-byte C++ pointers\");\n#endif\n#else\n#ifdef PLATFORM_32BITS\n\t#error PLATFORM_32BITS should not be defined.\n#endif\n#ifdef PLATFORM_64BITS\n\t#error PLATFORM_64BITS should not be defined.\n#endif\n#define PLATFORM_32BITS UE_DEPRECATED_MACRO(5.8, \"PLATFORM_32BITS is deprecated as UE only supports 64-bit.\") 0\n#define PLATFORM_64BITS UE_DEPRECATED_MACRO(5.8, \"PLATFORM_64BITS is deprecated as UE only supports 64-bit.\") 1\n#endif"
+				},
+				{
+					"static_assert(sizeof(void*) == 8, \"Pointer size must be 64-bit.\");",
+					"#if !SIMPLYSTREAM_MEMORY32\n\tstatic_assert(sizeof(void*) == 8, \"Pointer size must be 64-bit.\");\n#endif"
+				},
+			});
+			// The copied Platform.h resolves its quoted sibling include relative to the physical
+			// shadow directory. Mirror that unmodified sibling so the VFS-mapped header remains
+			// self-contained instead of depending on include-path order.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/HAL/PreprocessorHelpers.h", "HAL/PreprocessorHelpers.h", new Dictionary<string, string>(), true);
+			// FQualityLevels is commonly guarded by projects as an explicit member-audit. Native
+			// wasm32 makes each TArray four bytes smaller, changing the aggregate from the established
+			// 88-byte layout to 80 even though no member was added or removed. Over-align the two array
+			// fields in Memory32 so every project sees the stable aggregate size without source patches.
+			ShadowPatch(ShadowDir, false, "Runtime/Engine/Public/Scalability.h", "Scalability.h", new Dictionary<string, string>
+			{
+				{
+					"\t\tTArray<float> CPUBenchmarkSteps;\n\t\tTArray<float> GPUBenchmarkSteps;",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\talignas(8) TArray<float> CPUBenchmarkSteps;\n\t\talignas(8) TArray<float> GPUBenchmarkSteps;\n#else\n\t\tTArray<float> CPUBenchmarkSteps;\n\t\tTArray<float> GPUBenchmarkSteps;\n#endif"
+				},
+				{
+					"\t};\n\n\tDECLARE_MULTICAST_DELEGATE_OneParam(FOnScalabilitySettingsChanged, const Scalability::FQualityLevels&);",
+					"\t};\n\n#if SIMPLYSTREAM_MEMORY32\n\tstatic_assert(sizeof(FQualityLevels) == 88, \"SimplyStream Memory32 must preserve the established FQualityLevels aggregate size\");\n\tstatic_assert(alignof(FQualityLevels) == 8, \"SimplyStream Memory32 must preserve the established FQualityLevels alignment\");\n#endif\n\n\tDECLARE_MULTICAST_DELEGATE_OneParam(FOnScalabilitySettingsChanged, const Scalability::FQualityLevels&);"
+				},
+			}, true);
+			// Shader parameter structs deliberately keep resource slots eight bytes wide on every
+			// target so their C++ layout matches shader metadata and cooked layouts. UE's former
+			// 32-bit implementation wrapped a four-byte pointer with four bytes of padding; restore
+			// that behavior only for native wasm32 while leaving the rollback ABIs byte-identical.
+			ShadowPatch(ShadowDir, false, "Runtime/RenderCore/Public/ShaderParameterMacros.h", "ShaderParameterMacros.h", new Dictionary<string, string>
+			{
+				{
+					"/** Fixed 8bytes sized and aligned pointer for shader parameters. */\ntemplate<typename PtrType>\nusing TAlignedShaderParameterPtr = typename TAlignedTypedef<PtrType, SHADER_PARAMETER_POINTER_ALIGNMENT>::Type;",
+					"#if SIMPLYSTREAM_MEMORY32\n\n/** Fixed 8bytes sized pointer for shader parameters on a four-byte pointer ABI. */\ntemplate<typename PtrType>\nclass alignas(SHADER_PARAMETER_POINTER_ALIGNMENT) TAlignedShaderParameterPtr\n{\npublic:\n\tTAlignedShaderParameterPtr()\n\t{ }\n\n\tTAlignedShaderParameterPtr(const PtrType& Other)\n\t\t: Ref(Other)\n\t{ }\n\n\tTAlignedShaderParameterPtr(const TAlignedShaderParameterPtr<PtrType>& Other)\n\t\t: Ref(Other.Ref)\n\t{ }\n\n\tFORCEINLINE void operator=(const PtrType& Other)\n\t{\n\t\tRef = Other;\n\t}\n\n\tFORCEINLINE operator PtrType&()\n\t{\n\t\treturn Ref;\n\t}\n\n\tFORCEINLINE operator const PtrType&() const\n\t{\n\t\treturn Ref;\n\t}\n\n\tFORCEINLINE const PtrType& operator->() const\n\t{\n\t\treturn Ref;\n\t}\n\nprivate:\n\tPtrType Ref;\n\tuint32 Padding;\n\n\tstatic_assert(sizeof(void*) == 4, \"SimplyStream Memory32 requires four-byte C++ pointers.\");\n\tstatic_assert(sizeof(PtrType) == sizeof(void*), \"TAlignedShaderParameterPtr requires a pointer-sized type.\");\n};\n\n#else\n\n/** Fixed 8bytes sized and aligned pointer for shader parameters. */\ntemplate<typename PtrType>\nusing TAlignedShaderParameterPtr = typename TAlignedTypedef<PtrType, SHADER_PARAMETER_POINTER_ALIGNMENT>::Type;\n\n#endif"
+				},
+				{
+					"\tTAlignedShaderParameterPtr()\n\t{ }",
+					"\tTAlignedShaderParameterPtr()\n\t\t: Ref()\n\t\t, Padding(0)\n\t{ }"
+				},
+				{
+					"\tTAlignedShaderParameterPtr(const TAlignedShaderParameterPtr<PtrType>& Other)\n\t\t: Ref(Other.Ref)\n\t{ }",
+					"\tTAlignedShaderParameterPtr(const TAlignedShaderParameterPtr<PtrType>& Other)\n\t\t: Ref(Other.Ref)\n\t\t, Padding(0)\n\t{ }"
+				},
+				{
+					"\tTAlignedShaderParameterPtr(const PtrType& Other)\n\t\t: Ref(Other)\n\t{ }",
+					"\tTAlignedShaderParameterPtr(decltype(nullptr))\n\t\t: Ref(nullptr)\n\t\t, Padding(0)\n\t{ }\n\n\texplicit TAlignedShaderParameterPtr(const PtrType& Other)\n\t\t: Ref(Other)\n\t\t, Padding(0)\n\t{ }"
+				},
+				{
+					"\tFORCEINLINE void operator=(const PtrType& Other)\n\t{\n\t\tRef = Other;\n\t}",
+					"\tFORCEINLINE TAlignedShaderParameterPtr& operator=(const PtrType& Other)\n\t{\n\t\tRef = Other;\n\t\treturn *this;\n\t}"
+				},
+				{
+					"\tFORCEINLINE operator PtrType&()\n\t{\n\t\treturn Ref;\n\t}",
+					"\tFORCEINLINE PtrType* operator&()\n\t{\n\t\treturn &Ref;\n\t}\n\n\tFORCEINLINE const PtrType* operator&() const\n\t{\n\t\treturn &Ref;\n\t}\n\n\tFORCEINLINE operator PtrType&()\n\t{\n\t\treturn Ref;\n\t}"
+				},
+				{
+					"class alignas(SHADER_PARAMETER_POINTER_ALIGNMENT) TShaderResourceParameterArray : public TStaticArray<std::conditional_t<SHADER_PARAMETER_POINTER_ALIGNMENT == alignof(TElement), TElement, UE::Core::TAlignedElement<TElement, SHADER_PARAMETER_POINTER_ALIGNMENT>>, NumElements>",
+					"class alignas(SHADER_PARAMETER_POINTER_ALIGNMENT) TShaderResourceParameterArray : public TStaticArray<TAlignedShaderParameterPtr<TElement>, NumElements>"
+				},
+			}, true);
+			// This value is two uint32s consumed by shaders, not a native CPU pointer. Preserve its
+			// fixed eight-byte shader ABI and keep the original pointer-sized check for other modes.
+			ShadowPatch(ShadowDir, false, "Runtime/RHI/Public/RHIDescriptorRange.h", "RHIDescriptorRange.h", new Dictionary<string, string>
+			{
+				{
+					"static_assert(sizeof(FRHIDescriptorRangeShaderData) == sizeof(void*), \"FRHIDescriptorRangeShaderData must be exactly the same size as a pointer\");",
+					"#if SIMPLYSTREAM_MEMORY32\nstatic_assert(sizeof(FRHIDescriptorRangeShaderData) == sizeof(uint64), \"FRHIDescriptorRangeShaderData must preserve its eight-byte shader ABI\");\n#else\nstatic_assert(sizeof(FRHIDescriptorRangeShaderData) == sizeof(void*), \"FRHIDescriptorRangeShaderData must be exactly the same size as a pointer\");\n#endif"
+				},
+			}, true);
+			// OffsetType and SIZE_T are both uint32 on wasm32, so the convenience overloads collapse
+			// to duplicate declarations/definitions. The SIZE_T overload only performs a checked
+			// narrowing to OffsetType; omit it when no narrowing exists.
+			ShadowPatch(ShadowDir, false, "Runtime/SlateCore/Public/Types/SlateAttributeDescriptor.h", "Types/SlateAttributeDescriptor.h", new Dictionary<string, string>
+			{
+				{
+					"\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, OffsetType Offset, const FInvalidateWidgetReasonAttribute& ReasonGetter);\n\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, SIZE_T Offset, const FInvalidateWidgetReasonAttribute& ReasonGetter);\n\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, OffsetType Offset, FInvalidateWidgetReasonAttribute&& ReasonGetter);\n\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, SIZE_T Offset, FInvalidateWidgetReasonAttribute&& ReasonGetter);",
+					"\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, OffsetType Offset, const FInvalidateWidgetReasonAttribute& ReasonGetter);\n#if !SIMPLYSTREAM_MEMORY32\n\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, SIZE_T Offset, const FInvalidateWidgetReasonAttribute& ReasonGetter);\n#endif\n\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, OffsetType Offset, FInvalidateWidgetReasonAttribute&& ReasonGetter);\n#if !SIMPLYSTREAM_MEMORY32\n\t\tSLATECORE_API FAttributeEntry AddContainedAttribute(FName AttributeName, SIZE_T Offset, FInvalidateWidgetReasonAttribute&& ReasonGetter);\n#endif"
+				},
+			}, true);
+			ShadowPatch(ShadowDir, false, "Runtime/SlateCore/Private/Types/SlateAttributeDescriptor.cpp", "Runtime/SlateCore/Private/Types/SlateAttributeDescriptor.cpp", new Dictionary<string, string>
+			{
+				{
+					"FSlateAttributeDescriptor::FContainerInitializer::FAttributeEntry FSlateAttributeDescriptor::FContainerInitializer::AddContainedAttribute(FName AttributeName, SIZE_T Offset, const FInvalidateWidgetReasonAttribute& Reason)\n{\n\tcheck(Offset <= std::numeric_limits<OffsetType>::max());\n\treturn Descriptor.AddContainedAttribute(ContainerName, AttributeName, (OffsetType)Offset, Reason);\n}",
+					"#if !SIMPLYSTREAM_MEMORY32\nFSlateAttributeDescriptor::FContainerInitializer::FAttributeEntry FSlateAttributeDescriptor::FContainerInitializer::AddContainedAttribute(FName AttributeName, SIZE_T Offset, const FInvalidateWidgetReasonAttribute& Reason)\n{\n\tcheck(Offset <= std::numeric_limits<OffsetType>::max());\n\treturn Descriptor.AddContainedAttribute(ContainerName, AttributeName, (OffsetType)Offset, Reason);\n}\n#endif"
+				},
+				{
+					"FSlateAttributeDescriptor::FContainerInitializer::FAttributeEntry FSlateAttributeDescriptor::FContainerInitializer::AddContainedAttribute(FName AttributeName, SIZE_T Offset, FInvalidateWidgetReasonAttribute&& Reason)\n{\n\tcheck(Offset <= std::numeric_limits<OffsetType>::max());\n\treturn Descriptor.AddContainedAttribute(ContainerName, AttributeName, (OffsetType)Offset, MoveTemp(Reason));\n}",
+					"#if !SIMPLYSTREAM_MEMORY32\nFSlateAttributeDescriptor::FContainerInitializer::FAttributeEntry FSlateAttributeDescriptor::FContainerInitializer::AddContainedAttribute(FName AttributeName, SIZE_T Offset, FInvalidateWidgetReasonAttribute&& Reason)\n{\n\tcheck(Offset <= std::numeric_limits<OffsetType>::max());\n\treturn Descriptor.AddContainedAttribute(ContainerName, AttributeName, (OffsetType)Offset, MoveTemp(Reason));\n}\n#endif"
+				},
+			}, true);
+			// A 64-bit-indexed TArray can exist on a 32-bit address-space target, but every actual
+			// allocation must fit SIZE_T. Replace the blanket type-width assertion with a checked
+			// byte-count bound, then narrow only after that noreturn validation has passed.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Containers/ContainerAllocationPolicies.h", "Containers/ContainerAllocationPolicies.h", new Dictionary<string, string>
+			{
+				{
+					"\t\t\t\tstatic_assert(sizeof(SizeType) <= sizeof(SIZE_T), \"SIZE_T is expected to handle all possible sizes\");\n\n",
+					""
+				},
+				{
+					"\t\t\t\tif constexpr (sizeof(SizeType) == sizeof(SIZE_T))\n\t\t\t\t{\n\t\t\t\t\tbInvalidResize = bInvalidResize || (SIZE_T)(USizeType)NewMax > (SIZE_T)TNumericLimits<SizeType>::Max() / NumBytesPerElement;\n\t\t\t\t}",
+					"\t\t\t\tif (!bInvalidResize)\n\t\t\t\t{\n\t\t\t\t\tbInvalidResize = uint64(USizeType(NewMax)) > uint64(TNumericLimits<SIZE_T>::Max()) / uint64(NumBytesPerElement);\n\t\t\t\t}"
+				},
+				{
+					"\t\t\t\tif constexpr (sizeof(SizeType) == sizeof(SIZE_T))\n\t\t\t\t{\n\t\t\t\t\tbInvalidResize = bInvalidResize || ((SIZE_T)(USizeType)NewMax > (SIZE_T)TNumericLimits<SizeType>::Max() / NumBytesPerElement);\n\t\t\t\t}",
+					"\t\t\t\tif (!bInvalidResize)\n\t\t\t\t{\n\t\t\t\t\tbInvalidResize = uint64(USizeType(NewMax)) > uint64(TNumericLimits<SIZE_T>::Max()) / uint64(NumBytesPerElement);\n\t\t\t\t}"
+				},
+				{ "NewMax * NumBytesPerElement", "static_cast<SIZE_T>(NewMax) * NumBytesPerElement" },
+				{ "return CurrentMax * NumBytesPerElement;", "return static_cast<SIZE_T>(CurrentMax) * NumBytesPerElement;" },
+			}, true);
+			// Reference tokens deliberately remain uint64 so their token representation does not
+			// change with the native pointer ABI. BitCast requires equal-sized operands, so convert
+			// through UPTRINT when encoding and explicitly narrow back through UPTRINT when decoding.
+			ShadowPatch(ShadowDir, false, "Runtime/CoreUObject/Public/UObject/ReferenceToken.h", "UObject/ReferenceToken.h", new Dictionary<string, string>
+			{
+				{ "BitCast<uint64>(Object)", "EncodePointer(Object)" },
+				{ "BitCast<uint64>(GCObject)", "EncodePointer(GCObject)" },
+				{ "BitCast<uint64>(Cell)", "EncodePointer(Cell)" },
+				{ "BitCast<uint64>(GCObjectInfo)", "EncodePointer(GCObjectInfo)" },
+				{ "BitCast<uint64>(GCVerseCellInfo)", "EncodePointer(GCVerseCellInfo)" },
+				{ "BitCast<UObject*>(EncodedBits & ~EncodingBits)", "DecodePointer<UObject>(EncodedBits & ~EncodingBits)" },
+				{ "BitCast<FGCObject*>(EncodedBits & ~EncodingBits)", "DecodePointer<FGCObject>(EncodedBits & ~EncodingBits)" },
+				{ "BitCast<FGCObjectInfo*>(EncodedBits & ~EncodingBits)", "DecodePointer<FGCObjectInfo>(EncodedBits & ~EncodingBits)" },
+				{ "BitCast<Verse::VCell*>(EncodedBits & ~EncodingBits)", "DecodePointer<Verse::VCell>(EncodedBits & ~EncodingBits)" },
+				{ "BitCast<FGCVerseCellInfo*>(EncodedBits & ~EncodingBits)", "DecodePointer<FGCVerseCellInfo>(EncodedBits & ~EncodingBits)" },
+				{
+					"private:\n\tstatic constexpr uint64 EncodingBits = 0b111;",
+					"private:\n\ttemplate <typename T>\n\tstatic uint64 EncodePointer(const T* Pointer)\n\t{\n\t\treturn static_cast<uint64>(reinterpret_cast<UPTRINT>(Pointer));\n\t}\n\n\ttemplate <typename T>\n\tstatic T* DecodePointer(uint64 Bits)\n\t{\n\t\treturn reinterpret_cast<T*>(static_cast<UPTRINT>(Bits));\n\t}\n\n\tstatic constexpr uint64 EncodingBits = 0b111;"
+				},
+			}, true);
+			// UE previously carried an explicit 32-bit arena-pointer representation. Restore that
+			// representation for native wasm32 instead of shifting a 32-bit UPTRINT by 48 bits.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Memory/MemoryArena.h", "Memory/MemoryArena.h", new Dictionary<string, string>
+			{
+				{
+					"private:\n\tstatic constexpr int\tArenaShift\t= 48;",
+					"#if SIMPLYSTREAM_MEMORY32\nprivate:\n\tvoid*\tPtr = nullptr;\n\tuint16\tArenaTag = NoTag;\n\npublic:\n\tUE_FORCEINLINE_HINT const uint16\tGetArenaIndex() const\t{ return ArenaTag; }\n\tUE_FORCEINLINE_HINT void*\t\t\tGetPointer()\t\t\t{ return Ptr; }\n\tUE_FORCEINLINE_HINT const void*\t\tGetPointer() const\t\t{ return Ptr; }\n\tUE_FORCEINLINE_HINT void\t\t\tSetPointerAndArena(void* InPtr, uint16 InArenaTag) { Ptr = InPtr; ArenaTag = InArenaTag; }\n\n\tinline FArenaPointer(void* InPtr, uint16 InArenaTag) : Ptr(InPtr), ArenaTag(InArenaTag) {}\n\n#else\n\nprivate:\n\tstatic constexpr int\tArenaShift\t= 48;"
+				},
+				{
+					"\tinline FArenaPointer(void* Ptr, uint16 ArenaIndex) : TaggedPointer(reinterpret_cast<void*>(UPTRINT(Ptr) | (UPTRINT(ArenaIndex) << ArenaShift))) {};",
+					"\tinline FArenaPointer(void* Ptr, uint16 ArenaIndex) : TaggedPointer(reinterpret_cast<void*>(UPTRINT(Ptr) | (UPTRINT(ArenaIndex) << ArenaShift))) {};\n#endif"
+				},
+			}, true);
+			// Preserve the task's full debug-name pointer and 64-bit packed state on native wasm32.
+			// The delegate capacity is expressed in terms of sizeof(FPackedData), so FTask remains one
+			// cache line while the atomic state retains the same semantics as the 64-bit implementation.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Async/Fundamental/Task.h", "Async/Fundamental/Task.h", new Dictionary<string, string>
+			{
+				{
+					"\t\tunion FPackedData",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\tusing FPackedDataStorage = uint64;\n#else\n\t\tusing FPackedDataStorage = uintptr_t;\n#endif\n\n\t\tunion FPackedData"
+				},
+				{
+					"\t\t\tuintptr_t PackedData;\n\t\t\tstruct\n\t\t\t{\n\t\t\t\tuintptr_t State\t\t\t\t: 6;\n\t\t\t\tuintptr_t DebugName\t\t\t: 53;\n\t\t\t\tuintptr_t Priority\t\t\t: 3;\n\t\t\t\tuintptr_t Flags\t\t\t\t: 2;",
+					"\t\t\tFPackedDataStorage PackedData;\n\t\t\tstruct\n\t\t\t{\n\t\t\t\tFPackedDataStorage State\t\t\t: 6;\n\t\t\t\tFPackedDataStorage DebugName\t\t: 53;\n\t\t\t\tFPackedDataStorage Priority\t\t\t: 3;\n\t\t\t\tFPackedDataStorage Flags\t\t\t: 2;"
+				},
+				{ "\t\t\tFPackedData(uintptr_t InPackedData) : PackedData(InPackedData)", "\t\t\tFPackedData(FPackedDataStorage InPackedData) : PackedData(InPackedData)" },
+				{ "static_assert(sizeof(FPackedData) == sizeof(uintptr_t), \"Packed data needs to be pointer size\");", "static_assert(sizeof(FPackedData) == sizeof(FPackedDataStorage), \"Packed data must match its atomic storage\");" },
+				{ "return reinterpret_cast<const TCHAR*>(DebugName);", "return reinterpret_cast<const TCHAR*>(static_cast<uintptr_t>(DebugName));" },
+				{ "std::atomic<uintptr_t> PackedData { FPackedData().PackedData };", "std::atomic<FPackedDataStorage> PackedData { FPackedData().PackedData };" },
+				{ "PackedData.fetch_or(uintptr_t(State), Order)", "PackedData.fetch_or(FPackedDataStorage(State), Order)" },
+				{
+					"\t\tusing FTaskDelegate = TTaskDelegate<FTask*(bool), LOWLEVEL_TASK_SIZE - sizeof(FPackedData) - sizeof(void*)>;",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\t// Reserve eight bytes for the four-byte UserData pointer and the alignment\n\t\t// before the following eight-byte atomic. The delegate must be divisible by eight.\n\t\tusing FTaskDelegate = TTaskDelegate<FTask*(bool), LOWLEVEL_TASK_SIZE - sizeof(FPackedData) - sizeof(uint64)>;\n#else\n\t\tusing FTaskDelegate = TTaskDelegate<FTask*(bool), LOWLEVEL_TASK_SIZE - sizeof(FPackedData) - sizeof(void*)>;\n#endif"
+				},
+			}, true);
+			// The copied Task.h resolves this quoted include relative to its physical shadow path.
+			// Mirror the unmodified sibling so the VFS-mapped header remains self-contained.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Async/Fundamental/TaskDelegate.h", "Async/Fundamental/TaskDelegate.h", new Dictionary<string, string>(), true);
+			// Hash the pointer in a uint64 working value on every ABI. On wasm32 the upper half is
+			// naturally zero; keeping the mixer in uint64 avoids an invalid 32-bit shift by 32.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/Async/ParkingLot.cpp", "Runtime/Core/Private/Async/ParkingLot.cpp", new Dictionary<string, string>
+			{
+				{ "\tconst UPTRINT Value = UPTRINT(Address);", "\tconst uint64 Value = uint64(UPTRINT(Address));" },
+			}, true);
+			// Keep the automation tests type-explicit when uint32 and SIZE_T collapse to the same
+			// wasm32 type. This retains the tests instead of disabling the Development-only module.
+			ShadowPatch(ShadowDir, false, "../Plugins/Messaging/UdpMessaging/Source/UdpMessaging/Private/Tests/UdpMessageSegmenterTest.cpp", "Plugins/Messaging/UdpMessaging/Private/Tests/UdpMessageSegmenterTest.cpp", new Dictionary<string, string>
+			{
+				{ "Segmenter.GetSegmentCount(), NumSegments);", "Segmenter.GetSegmentCount(), (uint32)NumSegments);" },
+				{ "Segmenter.GetPendingSendSegments().CountSetBits(), Segmenter.GetPendingSendSegmentsCount());", "uint32(Segmenter.GetPendingSendSegments().CountSetBits()), Segmenter.GetPendingSendSegmentsCount());" },
+				{ "Segmenter.GetAcknowledgedSegmentsCount(), 0);", "Segmenter.GetAcknowledgedSegmentsCount(), 0u);" },
+				{ "Segmenter.GetAcknowledgedSegments().CountSetBits(), Segmenter.GetAcknowledgedSegmentsCount());", "uint32(Segmenter.GetAcknowledgedSegments().CountSetBits()), Segmenter.GetAcknowledgedSegmentsCount());" },
+			}, true);
+			// OpenXR's generated wasm handles are integers, so compare them with the API's
+			// architecture-aware null-handle constant rather than C++ nullptr.
+			ShadowPatch(ShadowDir, false, "../Plugins/Runtime/OpenXR/Source/OpenXRHMD/Private/OpenXRHMD.cpp", "Plugins/Runtime/OpenXR/OpenXRHMD/Private/OpenXRHMD.cpp", new Dictionary<string, string>
+			{
+				{ "LocalFloorSpace != nullptr", "LocalFloorSpace != XR_NULL_HANDLE" },
+				{ "StageSpace != nullptr", "StageSpace != XR_NULL_HANDLE" },
+			}, true);
+			// Keep optional StormSync automation tests enabled by selecting the intended
+			// signed TestEqual overload explicitly on the native 32-bit size_t ABI.
+			ShadowPatch(ShadowDir, false, "../Plugins/VirtualProduction/StormSync/Source/StormSyncTransportClient/Private/Tests/StormSyncTransportClientEndpoint.spec.cpp", "Plugins/VirtualProduction/StormSync/StormSyncTransportClient/Private/Tests/StormSyncTransportClientEndpoint.spec.cpp", new Dictionary<string, string>
+			{
+				{ "Buffer->Num(), MockTcpServer->GetBufferExpectedSize());", "Buffer->Num(), static_cast<int64>(MockTcpServer->GetBufferExpectedSize()));" },
+			}, true);
+			ShadowPatch(ShadowDir, false, "../Plugins/VirtualProduction/StormSync/Source/StormSyncTransportCore/Private/Tests/StormSyncTransportMessages.spec.cpp", "Plugins/VirtualProduction/StormSync/StormSyncTransportCore/Private/Tests/StormSyncTransportMessages.spec.cpp", new Dictionary<string, string>
+			{
+				{ "ConnectMessage.EngineVersion, FNetworkVersion::GetLocalNetworkVersion());", "ConnectMessage.EngineVersion, static_cast<int32>(FNetworkVersion::GetLocalNetworkVersion()));" },
+			}, true);
+			// Mutable's assertion is a footprint guard, not a serialized ABI. Its union is twelve
+			// bytes on a four-byte pointer ABI and sixteen bytes on the existing 64-bit ABIs.
+			ShadowPatch(ShadowDir, false, "../Plugins/Mutable/Source/MutableRuntime/Private/MuR/CodeRunner.h", "MuR/CodeRunner.h", new Dictionary<string, string>
+			{
+				{
+					"static_assert(sizeof(FScheduledOpData) == 4*4+sizeof(TManagedPtr<FResource>), \"FScheduledOpData size changed.\");",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\tstatic_assert(sizeof(FScheduledOpData) == 3*4+sizeof(TManagedPtr<FResource>), \"FScheduledOpData size changed.\");\n#else\n\t\tstatic_assert(sizeof(FScheduledOpData) == 4*4+sizeof(TManagedPtr<FResource>), \"FScheduledOpData size changed.\");\n#endif"
+				},
+			}, true);
+			// The pointer array uses int32 indices, but its free-list terminator is the uint32-invalid
+			// value. Encode that terminator as the otherwise-unreachable MAX_int32 value on wasm32 so
+			// the remaining 31 bits can still share a word with the low-bit free-entry tag.
+			ShadowPatch(ShadowDir, false, "Runtime/AssetRegistry/Private/AssetDataMap.cpp", "Runtime/AssetRegistry/Private/AssetDataMap.cpp", new Dictionary<string, string>
+			{
+				{
+					"\tstatic_assert(sizeof(UPTRINT) > sizeof(FAssetDataPtrIndex),\n\t\t\"We assume we can fit the entire FAssetDataPtrIndex, plus one additional bit, into a UPTRINT\");",
+					"#if SIMPLYSTREAM_MEMORY32\n\tcheckf(FreeIndex == AssetDataPtrIndexInvalid || FreeIndex < static_cast<FAssetDataPtrIndex>(MAX_int32),\n\t\tTEXT(\"Asset data free-list index does not fit its tagged wasm32 representation\"));\n\tconst UPTRINT EncodedFreeIndex = FreeIndex == AssetDataPtrIndexInvalid\n\t\t? static_cast<UPTRINT>(MAX_int32)\n\t\t: static_cast<UPTRINT>(FreeIndex);\n#else\n\tstatic_assert(sizeof(UPTRINT) > sizeof(FAssetDataPtrIndex),\n\t\t\"We assume we can fit the entire FAssetDataPtrIndex, plus one additional bit, into a UPTRINT\");\n\tconst UPTRINT EncodedFreeIndex = static_cast<UPTRINT>(FreeIndex);\n#endif"
+				},
+				{ "\tIntValue = 0x1 | (static_cast<UPTRINT>(FreeIndex) << 1);", "\tIntValue = 0x1 | (EncodedFreeIndex << 1);" },
+				{
+					"\tFreeIndex = static_cast<FAssetDataPtrIndex>(IntValue >> 1);",
+					"\tconst FAssetDataPtrIndex EncodedFreeIndex = static_cast<FAssetDataPtrIndex>(IntValue >> 1);\n#if SIMPLYSTREAM_MEMORY32\n\tFreeIndex = EncodedFreeIndex == static_cast<FAssetDataPtrIndex>(MAX_int32)\n\t\t? AssetDataPtrIndexInvalid\n\t\t: EncodedFreeIndex;\n#else\n\tFreeIndex = EncodedFreeIndex;\n#endif"
+				},
+			}, true);
+			// Preserve cache/slab layouts that intentionally occupy their 64-bit sizes. These are
+			// internal runtime structures, so explicit wasm32 padding is safer than weakening checks.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Internal/IO/PlatformIoDispatcherBase.h", "IO/PlatformIoDispatcherBase.h", new Dictionary<string, string>
+			{
+				{ "\tFIoFileBlockLink*\tNextLink = nullptr;", "\tFIoFileBlockLink*\tNextLink = nullptr;\n#if SIMPLYSTREAM_MEMORY32\n\tuint32\t\t\t\tMemory32Padding = 0;\n#endif" },
+			}, true);
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/HAL/MallocBinnedGPU.cpp", "Runtime/Core/Private/HAL/MallocBinnedGPU.cpp", new Dictionary<string, string>
+			{
+				{ "\tFFreeBlock* FirstFreeProxy;", "\tFFreeBlock* FirstFreeProxy;\n#if SIMPLYSTREAM_MEMORY32\n\tuint32 Memory32Padding = 0;\n#endif" },
+			}, true);
+			// Shared buffers expose uint64 lengths, but a native wasm32 allocation must fit SIZE_T.
+			// Route an oversized request through UE's noreturn OOM path before the explicit narrowing,
+			// while retaining the stock assertion and allocation expression for the rollback ABIs.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/Memory/SharedBuffer.cpp", "Runtime/Core/Private/Memory/SharedBuffer.cpp", new Dictionary<string, string>
+			{
+				{
+					"\tstatic_assert(~uint64(0) <= ~SIZE_T(0));",
+					"#if SIMPLYSTREAM_MEMORY32\n\tstatic void* Allocate(uint64 Size)\n\t{\n\t\tif (Size > static_cast<uint64>(~SIZE_T(0)))\n\t\t{\n\t\t\tFPlatformMemory::OnOutOfMemory(Size, 0);\n\t\t}\n\t\treturn FMemory::Malloc(static_cast<SIZE_T>(Size));\n\t}\n#else\n\tstatic_assert(~uint64(0) <= ~SIZE_T(0));\n#endif"
+				},
+				{ "\t\t: FBufferOwner(FMemory::Malloc(Size), Size)", "#if SIMPLYSTREAM_MEMORY32\n\t\t: FBufferOwner(Allocate(Size), Size)\n#else\n\t\t: FBufferOwner(FMemory::Malloc(Size), Size)\n#endif" },
+			}, true);
+			// FWorkBlock is allocated and returned as one 4096-byte page. Pad its smaller pointer
+			// array on wasm32 so the existing one-block-per-page ownership arithmetic remains valid.
+			ShadowPatch(ShadowDir, false, "Runtime/CoreUObject/Public/UObject/FastReferenceCollector.h", "UObject/FastReferenceCollector.h", new Dictionary<string, string>
+			{
+				{ "\tUObject* Objects[ObjectCapacity + ObjectLookahead];", "\tUObject* Objects[ObjectCapacity + ObjectLookahead];\n#if SIMPLYSTREAM_MEMORY32\n\tuint8 Memory32PagePadding[2048];\n#endif" },
+				{
+					"\tuint64* InstanceCursor = (uint64*)InstanceBegin;\t// Advanced via Jump to reach far members",
+					"#if SIMPLYSTREAM_MEMORY32\n\tUPTRINT* InstanceCursor = reinterpret_cast<UPTRINT*>(InstanceBegin);\t// Schema offsets use native reference-sized words.\n#else\n\tuint64* InstanceCursor = (uint64*)InstanceBegin;\t// Advanced via Jump to reach far members\n#endif"
+				},
+			}, true);
+			// The GC schema bytecode remains a sequence of fixed eight-byte FMemberWord records.
+			// Only offsets into live objects are pointer-sized on a native wasm32 ABI.
+			ShadowPatch(ShadowDir, false, "Runtime/CoreUObject/Private/UObject/GarbageCollectionSchema.cpp", "Runtime/CoreUObject/Private/UObject/GarbageCollectionSchema.cpp", new Dictionary<string, string>
+			{
+				{
+					"static constexpr uint32 MemberTypeCount =\t\t\tuint8(EMemberType::Count);",
+					"static constexpr uint32 MemberTypeCount =\t\t\tuint8(EMemberType::Count);\n#if SIMPLYSTREAM_MEMORY32\nstatic constexpr uint32 ReferenceWordSize =\t\t\tsizeof(UObject*);\n#else\nstatic constexpr uint32 ReferenceWordSize =\t\t\t8u;\n#endif"
+				},
+				{ "\t\t\t\tOffset = IntCastChecked<int32>(8 * (JumpedWords + Member.WordOffset));", "\t\t\t\tOffset = IntCastChecked<int32>(ReferenceWordSize * (JumpedWords + Member.WordOffset));" },
+				{ "\tcheckf(StructStride % 8 == 0, TEXT(\"Structs containing TObjectPtr/UObject* references must be 8-byte aligned\"));", "\tcheckf(StructStride % ReferenceWordSize == 0, TEXT(\"Structs containing TObjectPtr/UObject* references must be pointer aligned\"));" },
+				{ "\tcheck(StructStride % 8 == 0); // Builder memory stomp", "\tcheck(StructStride % ReferenceWordSize == 0); // Builder memory stomp" },
+				{ "\t\t\t\tMembers.Add({ FName(), OffsetForProperties + (JumpedWords + Member.WordOffset) * 8, Member.Type, ExtraWord});", "\t\t\t\tMembers.Add({ FName(), OffsetForProperties + (JumpedWords + Member.WordOffset) * ReferenceWordSize, Member.Type, ExtraWord});" },
+				{ "\t\tcheck(ByteOffset % 8 == 0);", "\t\tcheck(ByteOffset % ReferenceWordSize == 0);" },
+				{ "\t\tcheck(ByteOffset / 8 >= JumpWordPos);", "\t\tcheck(ByteOffset / ReferenceWordSize >= JumpWordPos);" },
+				{ "\t\tconst uint32 WordOffsetFromJumpPos = ByteOffset / 8 - IntCastChecked<uint32>(JumpWordPos);", "\t\tconst uint32 WordOffsetFromJumpPos = ByteOffset / ReferenceWordSize - IntCastChecked<uint32>(JumpWordPos);" },
+				{ "\t\t// 1 jump unit is OffsetRange words, a max jump is OffsetRange * OffsetRange * 8B = 32MB with 11 offset bits", "\t\t// 1 jump unit is OffsetRange reference words; a max jump spans OffsetRange * OffsetRange words." },
+				{ "\t\tcheck(ByteOffset / 8 <  JumpWordPos + OffsetRange);", "\t\tcheck(ByteOffset / ReferenceWordSize <  JumpWordPos + OffsetRange);" },
+				{ "InnerSchema.GetStructStride() / 8u", "InnerSchema.GetStructStride() / ReferenceWordSize" },
+				{ "\tcheck(StructStride % 8 == 0); // Memory stomp or use-after-free", "\tcheck(StructStride % ReferenceWordSize == 0); // Memory stomp or use-after-free" },
+				{ "\t\tconst uint8* Container = Instance + 8 * WordOffset;", "\t\tconst uint8* Container = Instance + ReferenceWordSize * WordOffset;" },
+			}, true);
+			// The runtime validity check consumes the same schema stride produced above.
+			ShadowPatch(ShadowDir, false, "Runtime/CoreUObject/Private/UObject/GarbageCollection.cpp", "Runtime/CoreUObject/Private/UObject/GarbageCollection.cpp", new Dictionary<string, string>
+			{
+				{ "\tcheck(Schema.GetHeader().StructStride % 8 == 0); // Memory stomp or using destroyed schema", "\tcheck(Schema.GetHeader().StructStride % sizeof(UObject*) == 0); // Memory stomp or using destroyed schema" },
+				{
+					"\t\tcheckf(Struct->GetCppStructOps()->GetAlignment() >= 8, TEXT(\"'%s' has AddStructReferencedObjects(), which requires at least 8B alignment \"), *Struct->GetPathName());",
+					"\t\tcheckf(Struct->GetCppStructOps()->GetAlignment() >= alignof(UObject*), TEXT(\"'%s' has AddStructReferencedObjects(), which requires native pointer alignment\"), *Struct->GetPathName());"
+				},
+			}, true);
+			// FPhysicsRwLock stores both per-thread recursion depths in one TLS pointer. Split the
+			// native pointer width evenly so wasm32 retains both counters instead of truncating the
+			// write depth, while the 64-bit ABIs preserve their existing 32-bit fields exactly.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/Chaos/Public/Framework/Threading.h", "Experimental/Chaos/Public/Framework/Threading.h", new Dictionary<string, string>
+			{
+				{
+					"\t\t\tFRwLockInfo(void* TlsSlotValue)\n\t\t\t{\n\t\t\t\tThreadReadDepth = uint32(uint64(TlsSlotValue));\n\t\t\t\tThreadWriteDepth = uint64(TlsSlotValue) >> 32;\n\t\t\t}\n\t\t\tvoid* GetTlsSlotValue()\n\t\t\t{\n\t\t\t\tuint64 ValueOut = uint64(ThreadReadDepth) | (uint64(ThreadWriteDepth) << 32);\n\t\t\t\treturn (void*)ValueOut;\n\t\t\t}",
+					"\t\t\tstatic constexpr uint32 DepthBitCount = sizeof(UPTRINT) * 8 / 2;\n\t\t\tstatic constexpr UPTRINT DepthMask = (UPTRINT(1) << DepthBitCount) - 1;\n\n\t\t\tFRwLockInfo(void* TlsSlotValue)\n\t\t\t{\n\t\t\t\tconst UPTRINT PackedDepths = reinterpret_cast<UPTRINT>(TlsSlotValue);\n\t\t\t\tThreadReadDepth = static_cast<uint32>(PackedDepths & DepthMask);\n\t\t\t\tThreadWriteDepth = static_cast<uint32>(PackedDepths >> DepthBitCount);\n\t\t\t}\n\t\t\tvoid* GetTlsSlotValue()\n\t\t\t{\n\t\t\t\tcheck(static_cast<UPTRINT>(ThreadReadDepth) <= DepthMask);\n\t\t\t\tcheck(static_cast<UPTRINT>(ThreadWriteDepth) <= DepthMask);\n\t\t\t\tconst UPTRINT PackedDepths =\n\t\t\t\t\tstatic_cast<UPTRINT>(ThreadReadDepth) |\n\t\t\t\t\t(static_cast<UPTRINT>(ThreadWriteDepth) << DepthBitCount);\n\t\t\t\treturn reinterpret_cast<void*>(PackedDepths);\n\t\t\t}"
+				},
+			}, true);
+			// FArrayHashBucket overlays a TArray with pointer-sized words. A wasm32 TArray is three
+			// words rather than the two words used by the 64-bit representation; copy and clear that
+			// third ArrayMax word anywhere the bucket manually manipulates its representation.
+			ShadowPatch(ShadowDir, false, "Runtime/CoreUObject/Private/UObject/UObjectHash.cpp", "Runtime/CoreUObject/Private/UObject/UObjectHash.cpp", new Dictionary<string, string>
+			{
+				{
+					"\tunion\n\t{\n\t\tFObjectsArray ObjectsList;\n\t\tstruct\n\t\t{\n\t\t\tUObjectBase* Elements[2];\n\t\t};\n\t};",
+					"\tunion\n\t{\n\t\tFObjectsArray ObjectsList;\n\t\tstruct\n\t\t{\n#if SIMPLYSTREAM_MEMORY32\n\t\t\tUObjectBase* Elements[3];\n#else\n\t\t\tUObjectBase* Elements[2];\n#endif\n\t\t};\n\t};"
+				},
+				{
+					"\tFORCEINLINE FArrayHashBucket(const FArrayHashBucket& Other)\n\t\t: Elements{ Other.Elements[0], Other.Elements[1] }\n\t{\n\t}",
+					"\tFORCEINLINE FArrayHashBucket(const FArrayHashBucket& Other)\n#if SIMPLYSTREAM_MEMORY32\n\t\t: Elements{ Other.Elements[0], Other.Elements[1], Other.Elements[2] }\n#else\n\t\t: Elements{ Other.Elements[0], Other.Elements[1] }\n#endif\n\t{\n\t}"
+				},
+				{
+					"\t\t\t\t\tElements[0] = Tmp;\n\t\t\t\t\tElements[1] = nullptr;",
+					"\t\t\t\t\tElements[0] = Tmp;\n\t\t\t\t\tElements[1] = nullptr;\n#if SIMPLYSTREAM_MEMORY32\n\t\t\t\t\tElements[2] = nullptr;\n#endif"
+				},
+				{
+					"\t\t\t\tElements[0] = nullptr;\n\t\t\t\tElements[1] = nullptr;",
+					"\t\t\t\tElements[0] = nullptr;\n\t\t\t\tElements[1] = nullptr;\n#if SIMPLYSTREAM_MEMORY32\n\t\t\t\tElements[2] = nullptr;\n#endif"
+				},
+			}, true);
+			// Bulk data cannot exceed the native address space. Preserve the 40-bit limit on the
+			// rollback ABIs and expose the full SIZE_T range on wasm32.
+			// Older toolchain revisions copied BulkDataBuffer.h into this persistent shadow tree.
+			// Remove that legacy copy before redirecting BulkData.h to the physical header, or a
+			// warm builder can discover both paths and define FBulkDataBuffer twice.
+			FileReference LegacyBulkDataBufferShadow = FileReference.Combine(ShadowDir, "Serialization/BulkDataBuffer.h");
+			if (FileReference.Exists(LegacyBulkDataBufferShadow))
+			{
+				FileReference.Delete(LegacyBulkDataBufferShadow);
+			}
+			ShadowPatch(ShadowDir, false, "Runtime/CoreUObject/Public/Serialization/BulkData.h", "Serialization/BulkData.h", new Dictionary<string, string>
+			{
+				{ "\tstatic constexpr SIZE_T MaxBulkDataSize = (1ull << 40) - 1;", "#if SIMPLYSTREAM_MEMORY32\n\tstatic constexpr SIZE_T MaxBulkDataSize = MAX_uint32;\n#else\n\tstatic constexpr SIZE_T MaxBulkDataSize = (1ull << 40) - 1;\n#endif" },
+				{ "#include \"BulkDataBuffer.h\"", "#include \"Runtime/CoreUObject/Public/Serialization/BulkDataBuffer.h\"" },
+			}, true);
+			// Use the native size_t-width half of Chaos's repeated sentinel pattern on wasm32. The
+			// rollback ABIs retain the stock eight-byte value and sentinel representation unchanged.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/Chaos/Public/Chaos/Framework/ScratchBuffer.h", "Chaos/Framework/ScratchBuffer.h", new Dictionary<string, string>
+			{
+				{ "\t\t\tstatic const size_t SentinelValue = 0xA1B2C3D4A1B2C3D4ll;", "#if SIMPLYSTREAM_MEMORY32\n\t\t\tstatic const size_t SentinelValue = 0xA1B2C3D4u;\n#else\n\t\t\tstatic const size_t SentinelValue = 0xA1B2C3D4A1B2C3D4ll;\n#endif" },
+			}, true);
+			// The BVH object remains tightly packed; its one pointer and trailing alignment shrink
+			// the no-padding size from 72 to 64 bytes on wasm32.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/Chaos/Private/Chaos/ImplicitObjectBVH.cpp", "Runtime/Experimental/Chaos/Private/Chaos/ImplicitObjectBVH.cpp", new Dictionary<string, string>
+			{
+				{ "\t\tstatic_assert(sizeof(FImplicitBVHObject) == 72, \"FImplicitBVHObject was packed to avoid any padding in it\");", "#if SIMPLYSTREAM_MEMORY32\n\t\tstatic_assert(sizeof(FImplicitBVHObject) == 64, \"FImplicitBVHObject was packed to avoid any padding in it\");\n#else\n\t\tstatic_assert(sizeof(FImplicitBVHObject) == 72, \"FImplicitBVHObject was packed to avoid any padding in it\");\n#endif" },
+			}, true);
+			// Binned3 reserves one 1 GiB virtual pool per small-bin size (over 77 GiB in this
+			// configuration), so it cannot be made valid by narrowing the request on a four-GiB
+			// address-space target. SimplyStream selects FMallocAnsi; retain the Binned3 symbol but
+			// fail explicitly if a future wasm32 configuration ever tries to instantiate it.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/HAL/MallocBinned3.cpp", "Runtime/Core/Private/HAL/MallocBinned3.cpp", new Dictionary<string, string>
+			{
+				{
+					"FMallocBinned3::FMallocBinned3(const FPlatformMemory::FPlatformVirtualMemoryBlock* ExternalMemoryBlock)\n{",
+					"FMallocBinned3::FMallocBinned3(const FPlatformMemory::FPlatformVirtualMemoryBlock* ExternalMemoryBlock)\n{\n#if SIMPLYSTREAM_MEMORY32\n\t(void)ExternalMemoryBlock;\n\tUE_LOGF(LogMemory, Fatal, \"FMallocBinned3 requires more virtual address space than SimplyStream Memory32 provides; use FMallocAnsi\");\n#else"
+				},
+				{
+					"\tGFixedMallocLocationPtr = (FMalloc**)(&MallocBinned3);\n}\n\nFMallocBinned3::~FMallocBinned3()",
+					"\tGFixedMallocLocationPtr = (FMalloc**)(&MallocBinned3);\n#endif\n}\n\nFMallocBinned3::~FMallocBinned3()"
+				},
+			}, true);
+			// FOutcome is deliberately an eight-byte tagged value. On wasm32, use fixed-width
+			// bitfield storage so the low 48-bit message/tag discriminator and signed 16-bit error
+			// code retain their existing representation while the embedded pointer occupies 32 bits.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/HttpClient/Private/Misc.inl", "Runtime/Experimental/IoStore/HttpClient/Private/Misc.inl", new Dictionary<string, string>
+			{
+				{
+					"\t\tstruct {\n\t\t\tUPTRINT\tMessage : 48;\n\t\t\tPTRINT\tCode\t: 16;\n\t\t};",
+					"\t\tstruct {\n#if SIMPLYSTREAM_MEMORY32\n\t\t\tuint64\tMessage : 48;\n\t\t\tint64\tCode\t: 16;\n#else\n\t\t\tUPTRINT\tMessage : 48;\n\t\t\tPTRINT\tCode\t: 16;\n#endif\n\t\t};"
+				},
+				{
+					"static_assert(sizeof(FOutcome) == sizeof(void*));",
+					"#if SIMPLYSTREAM_MEMORY32\nstatic_assert(sizeof(FOutcome) == sizeof(uint64));\n#else\nstatic_assert(sizeof(FOutcome) == sizeof(void*));\n#endif"
+				},
+			}, true);
+			// FActivity persists the complete tagged FOutcome in this union while failed. Give that
+			// slot the same fixed eight-byte storage on wasm32 rather than truncating it to UPTRINT.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/HttpClient/Private/Activity.inl", "Runtime/Experimental/IoStore/HttpClient/Private/Activity.inl", new Dictionary<string, string>
+			{
+				{ "\t\tUPTRINT\t\t\tError;", "#if SIMPLYSTREAM_MEMORY32\n\t\tuint64\t\t\tError;\n#else\n\t\tUPTRINT\t\t\tError;\n#endif" },
+			}, true);
+			// These are native-width handles and test tokens, not serialized 64-bit values.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/HttpClient/Private/Peer.inl", "Runtime/Experimental/IoStore/HttpClient/Private/Peer.inl", new Dictionary<string, string>
+			{
+				{ "\tstatic const FCertRootsRef\tDefault = ~0ull;", "\tstatic const FCertRootsRef\tDefault = ~FCertRootsRef(0);" },
+			}, true);
+			// Peer.inl reaches these through physical quoted includes. Keep its materialized shadow
+			// directory self-contained rather than relying on module-private include-path ordering.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/HttpClient/Private/TransactionOne.inl", "Runtime/Experimental/IoStore/HttpClient/Private/TransactionOne.inl", new Dictionary<string, string>(), true);
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/HttpClient/Private/TransactionTwo.inl", "Runtime/Experimental/IoStore/HttpClient/Private/TransactionTwo.inl", new Dictionary<string, string>(), true);
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/HttpClient/Private/Test.inl", "Runtime/Experimental/IoStore/HttpClient/Private/Test.inl", new Dictionary<string, string>
+			{
+				{ "\tUPTRINT SinkParam = 0xaa'493'493'493'493'bbull;", "#if SIMPLYSTREAM_MEMORY32\n\tUPTRINT SinkParam = 0xa493'493bu;\n#else\n\tUPTRINT SinkParam = 0xaa'493'493'493'493'bbull;\n#endif" },
+			}, true);
+			// FWork is copied only through native TArrays under a lock. Its pointer fields shrink the
+			// largest union member from nine uint16 words to seven on wasm32; keep the footprint guard
+			// architecture-aware without padding the queue records.
+			ShadowPatch(ShadowDir, false, "Runtime/Experimental/IoStore/OnDemand/Private/JournaledCache.cpp", "Runtime/Experimental/IoStore/OnDemand/Private/JournaledCache.cpp", new Dictionary<string, string>
+			{
+				{ "\tstatic_assert(sizeof(FWork) == sizeof(uint16) * 9);", "#if SIMPLYSTREAM_MEMORY32\n\tstatic_assert(sizeof(FWork) == sizeof(uint16) * 7);\n#else\n\tstatic_assert(sizeof(FWork) == sizeof(uint16) * 9);\n#endif" },
+			}, true);
+			// Restore the target-layout pointer width removed with UE's former 32-bit support. Raw
+			// pointers and frozen relative pointers are both four bytes for a native wasm32 image.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Serialization/MemoryLayout.h", "Serialization/MemoryLayout.h", new Dictionary<string, string>
+			{
+				{
+					"#define UE_STATIC_ONLY(T)\n",
+					"#define UE_STATIC_ONLY(T)\n\n#if defined(SIMPLYSTREAM_MEMORY32) && SIMPLYSTREAM_MEMORY32\nusing FPlatformMemoryImagePtrUInt = uint32;\n#else\nusing FPlatformMemoryImagePtrUInt = uint64;\n#endif\n"
+				},
+				{
+					"\t\tFlag_WithEditorOnly = (1 << 3),",
+					"\t\tFlag_WithEditorOnly = (1 << 3),\n#if SIMPLYSTREAM_MEMORY32\n\t\t// Distinguishes native compact frozen pointers from stock UE's 8-byte archive pointers.\n\t\tFlag_CompactMemoryImagePointers = (1 << 4),\n#endif"
+				},
+				{
+					"\tinline bool WithEditorOnly() const { return (Flags & Flag_WithEditorOnly) != 0u; }",
+					"\tinline bool WithEditorOnly() const { return (Flags & Flag_WithEditorOnly) != 0u; }\n#if SIMPLYSTREAM_MEMORY32\n\tinline bool HasCompactMemoryImagePointers() const { return (Flags & Flag_CompactMemoryImagePointers) != 0u; }\n#endif"
+				},
+				{
+					"\tinline uint32 GetRawPointerSize() const { return Is32Bit() ? sizeof(uint32) : sizeof(uint64); }",
+					"\tinline uint32 GetRawPointerSize() const { return Is32Bit() ? sizeof(uint32) : sizeof(uint64); }\n#if SIMPLYSTREAM_MEMORY32\n\tinline uint32 GetMemoryImagePointerSize() const { return HasCompactMemoryImagePointers() ? sizeof(uint32) : sizeof(uint64); }\n#else\n\tinline uint32 GetMemoryImagePointerSize() const { return sizeof(uint64); }\n#endif"
+				},
+			}, true);
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Serialization/MemoryImageWriter.h", "Serialization/MemoryImageWriter.h", new Dictionary<string, string>
+			{
+				{
+					"#include \"CoreTypes.h\"\n#include \"Serialization/MemoryLayout.h\"",
+					"#include \"CoreTypes.h\"\n#if SIMPLYSTREAM_MEMORY32\n#include \"HAL/UnrealMemory.h\"\n#endif\n#include \"Serialization/MemoryLayout.h\""
+				},
+				{
+					"\tCORE_API uint32 WriteNullPointer();\n\tCORE_API uint32 WriteRawPointerSizedBytes(uint64 PointerValue);",
+					"\tCORE_API uint32 WriteNullPointer();\n#if SIMPLYSTREAM_MEMORY32\n\tCORE_API uint32 WriteMemoryImagePointerSizedBytes(uint64 PointerValue);\n#endif\n\tCORE_API uint32 WriteRawPointerSizedBytes(uint64 PointerValue);"
+				},
+				{
+					"\tinline const FPointerTableBase* TryGetPrevPointerTable() const { return PrevPointerTable; }",
+					"\tinline const FPointerTableBase* TryGetPrevPointerTable() const { return PrevPointerTable; }\n\n#if SIMPLYSTREAM_MEMORY32\n\tinline uint32 GetFrozenMemoryImagePointerSize() const\n\t{\n\t\treturn FrozenLayoutParameters.GetMemoryImagePointerSize();\n\t}\n\n\tinline uint64 ReadFrozenMemoryImagePointer(const void* FrozenPointerStorage) const\n\t{\n\t\tconst uint32 PointerSize = GetFrozenMemoryImagePointerSize();\n\t\tcheck(PointerSize == sizeof(uint32) || PointerSize == sizeof(uint64));\n\t\tuint64 Packed = 0u;\n\t\tFMemory::Memcpy(&Packed, FrozenPointerStorage, PointerSize);\n\t\treturn Packed;\n\t}\n\n\tinline const void* ResolveFrozenMemoryImagePointer(const void* FrozenPointerStorage) const\n\t{\n\t\tconst uint64 Packed = ReadFrozenMemoryImagePointer(FrozenPointerStorage);\n\t\tif (Packed == 0u)\n\t\t{\n\t\t\treturn nullptr;\n\t\t}\n\t\tcheck((Packed & 1u) != 0u);\n\t\tconst int64 Offset = GetFrozenMemoryImagePointerSize() == sizeof(uint32)\n\t\t\t? int64(static_cast<int32>(static_cast<uint32>(Packed))) >> 1\n\t\t\t: static_cast<int64>(Packed) >> 24;\n\t\treturn static_cast<const uint8*>(FrozenPointerStorage) + Offset;\n\t}\n\n\tinline int32 GetFrozenMemoryImagePointerTypeIndex(const void* FrozenPointerStorage) const\n\t{\n\t\tcheck(GetFrozenMemoryImagePointerSize() == sizeof(uint64));\n\t\tconst uint64 Packed = ReadFrozenMemoryImagePointer(FrozenPointerStorage);\n\t\tcheck((Packed & 1u) != 0u);\n\t\treturn static_cast<int32>((Packed >> 1u) & ((uint64(1u) << 23u) - 1u)) - 1;\n\t}\n#endif"
+				},
+			}, true);
+			// TArray and THashTable are intrinsic layouts, so their frozen size must be computed
+			// from the target pointer width rather than sizeof() on the Linux cooker host.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Containers/Array.h", "Containers/Array.h", new Dictionary<string, string>
+			{
+				{
+					"\t\tObject.CopyUnfrozen(Context, OutDst);\n\t\treturn sizeof(Object);",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\tif constexpr (::TAllocatorTraits<AllocatorType>::SupportsFreezeMemoryImage && THasTypeLayout<T>::Value)\n\t\t{\n\t\t\tconst uint8* FrozenArray = reinterpret_cast<const uint8*>(&Object);\n\t\t\tconst uint32 PointerSize = Context.GetFrozenMemoryImagePointerSize();\n\t\t\tint32 ArrayNum = 0;\n\t\t\tFMemory::Memcpy(&ArrayNum, FrozenArray + PointerSize, sizeof(ArrayNum));\n\t\t\tcheck(ArrayNum >= 0);\n\n\t\t\tTArray<T, AllocatorType>* DstArray = ::new(OutDst) TArray<T, AllocatorType>();\n\t\t\tDstArray->SetNumZeroed(ArrayNum);\n\t\t\tif (ArrayNum > 0)\n\t\t\t{\n\t\t\t\tconst uint8* FrozenElements = static_cast<const uint8*>(Context.ResolveFrozenMemoryImagePointer(FrozenArray));\n\t\t\t\tcheck(FrozenElements);\n\t\t\t\tuint8* UnfrozenElements = reinterpret_cast<uint8*>(DstArray->GetData());\n\t\t\t\tconst FTypeLayoutDesc& ElementTypeDesc = StaticGetTypeLayoutDesc<T>();\n\t\t\t\tFTypeLayoutDesc::FUnfrozenCopyFunc* CopyElement = ElementTypeDesc.UnfrozenCopyFunc;\n\t\t\t\tconst uint32 FrozenElementAlignment = Freeze::GetTargetAlignment(ElementTypeDesc, Context.FrozenLayoutParameters);\n\t\t\t\tuint32 FrozenOffset = 0u;\n\t\t\t\tfor (int32 Index = 0; Index < ArrayNum; ++Index)\n\t\t\t\t{\n\t\t\t\t\tconst uint32 FrozenElementSize = CopyElement(Context, FrozenElements + FrozenOffset, ElementTypeDesc, UnfrozenElements + ElementTypeDesc.Size * Index);\n\t\t\t\t\tFrozenOffset = Align(FrozenOffset + FrozenElementSize, FrozenElementAlignment);\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\telse\n\t\t{\n\t\t\t::new(OutDst) TArray<T, AllocatorType>();\n\t\t}\n\t\treturn Context.GetFrozenMemoryImagePointerSize() + sizeof(int32) * 2;\n#else\n\t\tObject.CopyUnfrozen(Context, OutDst);\n\t\treturn sizeof(Object);\n#endif"
+				},
+				{
+					"\t\treturn AppendHashForNameAndSize(TypeDesc.Name, sizeof(TArray<T, AllocatorType>), Hasher);",
+					"\t\tstatic_assert(sizeof(TArray<T, AllocatorType>) == sizeof(FPlatformMemoryImagePtrUInt) + sizeof(int32) * 2, \"Unexpected TArray size\");\n\t\tconst uint32 SizeFromFields = LayoutParams.GetMemoryImagePointerSize() + sizeof(int32) * 2;\n\t\treturn AppendHashForNameAndSize(TypeDesc.Name, SizeFromFields, Hasher);"
+				},
+				{
+					"\t\treturn FMath::Min(8u, LayoutParams.MaxFieldAlignment);\n\t}\n\n\ttemplate<typename T, typename AllocatorType>\n\tUE_NODEBUG void IntrinsicToString",
+					"\t\treturn FMath::Min(LayoutParams.GetMemoryImagePointerSize(), LayoutParams.MaxFieldAlignment);\n\t}\n\n\ttemplate<typename T, typename AllocatorType>\n\tUE_NODEBUG void IntrinsicToString"
+				},
+			}, true);
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Containers/HashTable.h", "Containers/HashTable.h", new Dictionary<string, string>
+			{
+				{
+					"\t\tif constexpr (TAllocatorTraits<Allocator>::SupportsFreezeMemoryImage)\n\t\t{\n\t\t\tTHashTable* DstTable = ::new(Dst) THashTable(this->HashMask + 1u, this->IndexSize);\n\t\t\tFMemory::Memcpy(DstTable->Hash.GetAllocation(), this->Hash.GetAllocation(), (this->HashMask + 1u) * 4);\n\t\t\tFMemory::Memcpy(DstTable->NextIndex.GetAllocation(), this->NextIndex.GetAllocation(), this->IndexSize * 4);\n\t\t}\n\t\telse\n\t\t{\n\t\t\t::new(Dst) THashTable();\n\t\t}",
+					"\t\tif constexpr (TAllocatorTraits<Allocator>::SupportsFreezeMemoryImage)\n\t\t{\n#if SIMPLYSTREAM_MEMORY32\n\t\t\tconst uint8* FrozenTable = reinterpret_cast<const uint8*>(this);\n\t\t\tconst uint32 PointerSize = Context.GetFrozenMemoryImagePointerSize();\n\t\t\tuint32 FrozenHashMask = 0u;\n\t\t\tuint32 FrozenIndexSize = 0u;\n\t\t\tFMemory::Memcpy(&FrozenHashMask, FrozenTable + PointerSize * 2u, sizeof(FrozenHashMask));\n\t\t\tFMemory::Memcpy(&FrozenIndexSize, FrozenTable + PointerSize * 2u + sizeof(FrozenHashMask), sizeof(FrozenIndexSize));\n\t\t\tTHashTable* DstTable = ::new(Dst) THashTable(FrozenHashMask + 1u, FrozenIndexSize);\n\t\t\tconst uint32* FrozenHash = static_cast<const uint32*>(Context.ResolveFrozenMemoryImagePointer(FrozenTable));\n\t\t\tcheck(FrozenHash);\n\t\t\tFMemory::Memcpy(DstTable->Hash.GetAllocation(), FrozenHash, (FrozenHashMask + 1u) * sizeof(uint32));\n\t\t\tif (FrozenIndexSize > 0u)\n\t\t\t{\n\t\t\t\tconst uint32* FrozenNextIndex = static_cast<const uint32*>(Context.ResolveFrozenMemoryImagePointer(FrozenTable + PointerSize));\n\t\t\t\tcheck(FrozenNextIndex);\n\t\t\t\tFMemory::Memcpy(DstTable->NextIndex.GetAllocation(), FrozenNextIndex, FrozenIndexSize * sizeof(uint32));\n\t\t\t}\n#else\n\t\t\tTHashTable* DstTable = ::new(Dst) THashTable(this->HashMask + 1u, this->IndexSize);\n\t\t\tFMemory::Memcpy(DstTable->Hash.GetAllocation(), this->Hash.GetAllocation(), (this->HashMask + 1u) * 4);\n\t\t\tFMemory::Memcpy(DstTable->NextIndex.GetAllocation(), this->NextIndex.GetAllocation(), this->IndexSize * 4);\n#endif\n\t\t}\n\t\telse\n\t\t{\n\t\t\t::new(Dst) THashTable();\n\t\t}"
+				},
+				{
+					"\t\tObject.CopyUnfrozen(Context, OutDst);\n\t\treturn sizeof(Object);",
+					"\t\tObject.CopyUnfrozen(Context, OutDst);\n#if SIMPLYSTREAM_MEMORY32\n\t\treturn Context.GetFrozenMemoryImagePointerSize() * 2u + sizeof(uint32) * 2u;\n#else\n\t\treturn sizeof(Object);\n#endif"
+				},
+				{
+					"\t\treturn AppendHashForNameAndSize(TypeDesc.Name, sizeof(THashTable<InAllocator>), Hasher);",
+					"\t\tstatic_assert(sizeof(THashTable<InAllocator>) == sizeof(FPlatformMemoryImagePtrUInt) * 2 + sizeof(uint32) * 2, \"Unexpected THashTable size\");\n\t\tconst uint32 SizeFromFields = LayoutParams.GetMemoryImagePointerSize() * 2 + sizeof(uint32) * 2;\n\t\treturn AppendHashForNameAndSize(TypeDesc.Name, SizeFromFields, Hasher);"
+				},
+				{
+					"\t\t// Assume alignment of hash-table is drive by pointer\n\t\treturn FMath::Min(8u, LayoutParams.MaxFieldAlignment);",
+					"\t\t// Assume alignment of hash-table is driven by its frozen pointer width.\n\t\treturn FMath::Min(LayoutParams.GetMemoryImagePointerSize(), LayoutParams.MaxFieldAlignment);"
+				},
+			}, true);
+			// Tuple elements are serialized at target-layout offsets, which differ when either
+			// element contains a frozen pointer. Walk the archived pair instead of dereferencing
+			// it through the compact wasm32 C++ layout during cross-layout conversion.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Templates/Tuple.h", "Templates/Tuple.h", new Dictionary<string, string>
+			{
+				{
+					"\t\tTTuple<KeyType, ValueType>* DstObject = (TTuple<KeyType, ValueType>*)OutDst;\n\t\tContext.UnfreezeObject(Object.Key, &DstObject->Key);\n\t\tContext.UnfreezeObject(Object.Value, &DstObject->Value);\n\t\treturn sizeof(Object);",
+					"\t\tTTuple<KeyType, ValueType>* DstObject = (TTuple<KeyType, ValueType>*)OutDst;\n#if SIMPLYSTREAM_MEMORY32\n\t\tconst uint8* FrozenTuple = reinterpret_cast<const uint8*>(&Object);\n\t\tconst FTypeLayoutDesc& KeyTypeDesc = StaticGetTypeLayoutDesc<KeyType>();\n\t\tconst FTypeLayoutDesc& ValueTypeDesc = StaticGetTypeLayoutDesc<ValueType>();\n\t\tconst uint32 FrozenKeySize = Context.UnfreezeObject(FrozenTuple, KeyTypeDesc, &DstObject->Key);\n\t\tconst uint32 FrozenValueAlignment = FMath::Min(Freeze::GetTargetAlignment(ValueTypeDesc, Context.FrozenLayoutParameters), Context.FrozenLayoutParameters.MaxFieldAlignment);\n\t\tconst uint32 FrozenValueOffset = Align(FrozenKeySize, FrozenValueAlignment);\n\t\tconst uint32 FrozenValueSize = Context.UnfreezeObject(FrozenTuple + FrozenValueOffset, ValueTypeDesc, &DstObject->Value);\n\t\treturn FrozenValueOffset + FrozenValueSize;\n#else\n\t\tContext.UnfreezeObject(Object.Key, &DstObject->Key);\n\t\tContext.UnfreezeObject(Object.Value, &DstObject->Value);\n\t\treturn sizeof(Object);\n#endif"
+				},
+			}, true);
+			// Native wasm32 stores a signed relative offset plus the low frozen bit in four bytes.
+			// The existing eight-byte representation remains byte-identical for every other mode.
+			// Stock UE cooks 32-bit target images with eight-byte frozen pointers. Keep that archive
+			// format readable, unfreeze it through UE's dependency table, then re-freeze to compact
+			// four-byte pointers for the native wasm32 runtime.
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Public/Serialization/MemoryImage.h", "Serialization/MemoryImage.h", new Dictionary<string, string>
+			{
+				{
+					"#define UE_MEMORYIMAGE_TRACK_TYPE_DEPENDENCIES (WITH_EDITORONLY_DATA)",
+					"#if SIMPLYSTREAM_MEMORY32\n#define UE_MEMORYIMAGE_TRACK_TYPE_DEPENDENCIES 1\n#else\n#define UE_MEMORYIMAGE_TRACK_TYPE_DEPENDENCIES (WITH_EDITORONLY_DATA)\n#endif"
+				},
+				{
+					"\tCORE_API FMemoryImageSection* WritePointer(const FTypeLayoutDesc& StaticTypeDesc, const FTypeLayoutDesc& DerivedTypeDesc, uint32* OutOffsetToBase = nullptr);\n\tCORE_API uint32 WriteRawPointerSizedBytes(uint64 PointerValue);",
+					"\tCORE_API FMemoryImageSection* WritePointer(const FTypeLayoutDesc& StaticTypeDesc, const FTypeLayoutDesc& DerivedTypeDesc, uint32* OutOffsetToBase = nullptr);\n#if SIMPLYSTREAM_MEMORY32\n\tCORE_API uint32 WriteMemoryImagePointerSizedBytes(uint64 PointerValue);\n#endif\n\tCORE_API uint32 WriteRawPointerSizedBytes(uint64 PointerValue);"
+				},
+				{
+					"static_assert(sizeof(FFrozenMemoryImagePtr) == sizeof(uint64), \"FFrozenMemoryImagePtr is larger than a native pointer would be\");",
+					"struct FFrozenMemoryImagePtr32\n{\n\tstatic constexpr uint32 IsFrozenMask = 1u;\n\tstatic constexpr int64 MinOffset = -(int64(1) << 30);\n\tstatic constexpr int64 MaxOffset = (int64(1) << 30) - 1;\n\n\tuint32 Packed;\n\n\tbool IsFrozen() const\n\t{\n\t\treturn (Packed & IsFrozenMask) != 0u;\n\t}\n\n\tvoid SetIsFrozen(bool bTrue)\n\t{\n\t\tPacked = (Packed & ~IsFrozenMask) | (bTrue ? IsFrozenMask : 0u);\n\t}\n\n\tint64 GetOffsetFromThis() const\n\t{\n\t\treturn int64(static_cast<int32>(Packed)) >> 1;\n\t}\n\n\tvoid SetOffsetFromThis(int64 Offset)\n\t{\n\t\tcheckf(Offset >= MinOffset && Offset <= MaxOffset,\n\t\t\tTEXT(\"A wasm32 frozen-memory pointer offset must fit in signed 31-bit tagged storage\"));\n\t\tPacked = (Packed & IsFrozenMask) | (static_cast<uint32>(static_cast<int32>(Offset)) << 1);\n\t}\n\n\tint32 GetTypeIndex() const\n\t{\n\t\treturn INDEX_NONE;\n\t}\n};\n\nstatic_assert(sizeof(FFrozenMemoryImagePtr32) == sizeof(uint32), \"FFrozenMemoryImagePtr32 must occupy one wasm32 pointer word\");\nstatic_assert(sizeof(FFrozenMemoryImagePtr) == sizeof(uint64), \"FFrozenMemoryImagePtr is larger than a native pointer would be\");"
+				},
+				{
+					"\t\tuint64 Packed;\n\t\tFFrozenMemoryImagePtr Frozen;\n\t\tT* UnfrozenPtr;",
+					"\t\tFPlatformMemoryImagePtrUInt Packed;\n#if defined(SIMPLYSTREAM_MEMORY32) && SIMPLYSTREAM_MEMORY32\n\t\tFFrozenMemoryImagePtr32 Frozen;\n#else\n\t\tFFrozenMemoryImagePtr Frozen;\n#endif\n\t\tT* UnfrozenPtr;"
+				},
+				{
+					"\ttemplate<typename T>\n\tuint32 IntrinsicUnfrozenCopy(const FMemoryUnfreezeContent& Context, const TMemoryImagePtr<T>& Object, void* OutDst)\n\t{\n\t\tconst T* RawPtr = Object.Get();",
+					"\ttemplate<typename T>\n\tuint32 IntrinsicUnfrozenCopy(const FMemoryUnfreezeContent& Context, const TMemoryImagePtr<T>& Object, void* OutDst)\n\t{\n#if SIMPLYSTREAM_MEMORY32\n\t\tconst T* RawPtr = static_cast<const T*>(Context.ResolveFrozenMemoryImagePointer(&Object));\n#else\n\t\tconst T* RawPtr = Object.Get();\n#endif"
+				},
+				{
+					"\t\t\tconst FTypeLayoutDesc* DerivedTypeDesc = Context.GetDerivedTypeDesc(StaticTypeDesc, Object.GetFrozenTypeIndex());\n\t\t\tif (!DerivedTypeDesc && Context.bIsFrozenForCurrentPlatform)\n\t\t\t{\n\t\t\t\t// It's possible we won't be able to get derived type desc from the context, if we're not storing type dependencies\n\t\t\t\t// In this case, if we're unfreezing data for the current platform, we can just grab the derived type directly from the frozen object\n\t\t\t\t// If we're NOT unfreezing data for current platform, we can't access the frozen object, so we'll fail in that case\n\t\t\t\tDerivedTypeDesc = &GetTypeLayoutDesc(Context.PrevPointerTable, *RawPtr);\n\t\t\t}",
+					"\t\t\tconst FTypeLayoutDesc* DerivedTypeDesc = nullptr;\n#if SIMPLYSTREAM_MEMORY32\n\t\t\tif (Context.GetFrozenMemoryImagePointerSize() == sizeof(uint32))\n\t\t\t{\n\t\t\t\t// Compact pointers omit the type index; their patched target object carries it.\n\t\t\t\tDerivedTypeDesc = &GetTypeLayoutDesc(Context.PrevPointerTable, *RawPtr);\n\t\t\t}\n\t\t\telse\n\t\t\t{\n\t\t\t\tDerivedTypeDesc = Context.GetDerivedTypeDesc(StaticTypeDesc, Context.GetFrozenMemoryImagePointerTypeIndex(&Object));\n\t\t\t}\n#else\n\t\t\tDerivedTypeDesc = Context.GetDerivedTypeDesc(StaticTypeDesc, Object.GetFrozenTypeIndex());\n\t\t\tif (!DerivedTypeDesc && Context.bIsFrozenForCurrentPlatform)\n\t\t\t{\n\t\t\t\t// If type dependencies were omitted for a matching image, recover the dynamic type directly.\n\t\t\t\tDerivedTypeDesc = &GetTypeLayoutDesc(Context.PrevPointerTable, *RawPtr);\n\t\t\t}\n#endif"
+				},
+				{
+					"\t\treturn sizeof(Object);\n\t}\n\n\ttemplate<typename T>\n\tuint32 IntrinsicAppendHash",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\treturn Context.GetFrozenMemoryImagePointerSize();\n#else\n\t\treturn sizeof(Object);\n#endif\n\t}\n\n\ttemplate<typename T>\n\tuint32 IntrinsicAppendHash"
+				},
+				{
+					"\t\treturn AppendHashForNameAndSize(TypeDesc.Name, sizeof(TMemoryImagePtr<T>), Hasher);",
+					"\t\treturn AppendHashForNameAndSize(TypeDesc.Name, LayoutParams.GetMemoryImagePointerSize(), Hasher);"
+				},
+				{
+					"\t\treturn FMath::Min(8u, LayoutParams.MaxFieldAlignment);\n\t}\n\n\ttemplate<typename T>\n\tvoid IntrinsicToString",
+					"\t\treturn FMath::Min(LayoutParams.GetMemoryImagePointerSize(), LayoutParams.MaxFieldAlignment);\n\t}\n\n\ttemplate<typename T>\n\tvoid IntrinsicToString"
+				},
+				{
+					"\tstatic_assert(sizeof(PtrType) <= sizeof(uint64), \"PtrType must fit within a standard pointer\");\n\tunion\n\t{\n\t\tPtrType Ptr;\n\t\tuint64 PackedIndex;",
+					"\tstatic_assert(sizeof(PtrType) <= sizeof(FPlatformMemoryImagePtrUInt), \"PtrType must fit within a target memory-image pointer\");\n\tunion\n\t{\n\t\tPtrType Ptr;\n\t\tFPlatformMemoryImagePtrUInt PackedIndex;"
+				},
+				{
+					"\t\t\tconst uint64 FrozenPackedIndex = ((uint64)Index << 1u) | 1u;\n\t\t\tWriter.WriteBytes(FrozenPackedIndex);",
+					"\t\t\tconst uint64 FrozenPackedIndex = ((uint64)Index << 1u) | 1u;\n#if SIMPLYSTREAM_MEMORY32\n\t\t\tWriter.WriteMemoryImagePointerSizedBytes(FrozenPackedIndex);\n#else\n\t\t\tWriter.WriteBytes(FrozenPackedIndex);\n#endif"
+				},
+				{
+					"\t\t\tWriter.WriteBytes(uint64(0u));",
+					"#if SIMPLYSTREAM_MEMORY32\n\t\t\tWriter.WriteMemoryImagePointerSizedBytes(0u);\n#else\n\t\t\tWriter.WriteBytes(uint64(0u));\n#endif"
+				},
+				{
+					"\ttemplate<typename T, typename PtrType>\n\tuint32 IntrinsicUnfrozenCopy(const FMemoryUnfreezeContent& Context, const TIndexedPtrBase<T, PtrType>& Object, void* OutDst)\n\t{\n\t\tnew(OutDst) TIndexedPtrBase<T, PtrType>(Object.Get(Context.TryGetPrevPointerTable()));\n\t\treturn sizeof(Object);\n\t}",
+					"\ttemplate<typename T, typename PtrType>\n\tuint32 IntrinsicUnfrozenCopy(const FMemoryUnfreezeContent& Context, const TIndexedPtrBase<T, PtrType>& Object, void* OutDst)\n\t{\n#if SIMPLYSTREAM_MEMORY32\n\t\tconst uint64 PackedIndex = Context.ReadFrozenMemoryImagePointer(&Object);\n\t\tT* RawPtr = nullptr;\n\t\tif (PackedIndex != 0u)\n\t\t{\n\t\t\tcheck((PackedIndex & 1u) != 0u);\n\t\t\tcheck(Context.TryGetPrevPointerTable());\n\t\t\tconst FTypeLayoutDesc& PointerTypeDesc = StaticGetTypeLayoutDesc<TIndexedPtrBase<T, PtrType>>();\n\t\t\tRawPtr = static_cast<T*>(Context.TryGetPrevPointerTable()->GetIndexedPointer(PointerTypeDesc, static_cast<uint32>(PackedIndex >> 1u)));\n\t\t}\n\t\tnew(OutDst) TIndexedPtrBase<T, PtrType>(RawPtr);\n\t\treturn Context.GetFrozenMemoryImagePointerSize();\n#else\n\t\tnew(OutDst) TIndexedPtrBase<T, PtrType>(Object.Get(Context.TryGetPrevPointerTable()));\n\t\treturn sizeof(Object);\n#endif\n\t}"
+				},
+				{
+					"\t\treturn AppendHashForNameAndSize(TypeDesc.Name, sizeof(TIndexedPtrBase<T, PtrType>), Hasher);",
+					"\t\treturn AppendHashForNameAndSize(TypeDesc.Name, LayoutParams.GetMemoryImagePointerSize(), Hasher);"
+				},
+				{
+					"\t\treturn FMath::Min(8u, LayoutParams.MaxFieldAlignment);\n\t}\n}\n\ntemplate<typename T>\nusing TIndexedPtr",
+					"\t\treturn FMath::Min(LayoutParams.GetMemoryImagePointerSize(), LayoutParams.MaxFieldAlignment);\n\t}\n}\n\ntemplate<typename T>\nusing TIndexedPtr"
+				},
+			}, true);
+			ShadowPatch(ShadowDir, false, "Runtime/Core/Private/Serialization/MemoryImage.cpp", "Runtime/Core/Private/Serialization/MemoryImage.cpp", new Dictionary<string, string>
+			{
+				{
+					"#define MEMORYIMAGE_DERIVEDDATA_VER_ANSI\t\t\"B6A0A753ED62499D8F30931E61FCAB05\"",
+					"#define MEMORYIMAGE_DERIVEDDATA_VER_ANSI\t\t\"B6A0A753ED62499D8F30931E61FCAB05\"\n#if SIMPLYSTREAM_MEMORY32\n#undef MEMORYIMAGE_DERIVEDDATA_VER_ANSI\n#define MEMORYIMAGE_DERIVEDDATA_VER_ANSI\t\t\"E01C0074037F459C9B1EC16BF9E36FFF\"\n#endif"
+				},
+				{
+					"\tFlags = Flag_Initialized;\n\tif (WITH_EDITORONLY_DATA) Flags |= Flag_WithEditorOnly;\n\n\tcheck(GetRawPointerSize() == sizeof(void*));",
+					"\tFlags = Flag_Initialized;\n\tif (WITH_EDITORONLY_DATA) Flags |= Flag_WithEditorOnly;\n#if SIMPLYSTREAM_MEMORY32\n\tFlags |= Flag_Is32Bit | Flag_CompactMemoryImagePointers;\n#endif\n\n\tcheck(GetRawPointerSize() == sizeof(void*));\n#if SIMPLYSTREAM_MEMORY32\n\tcheck(GetMemoryImagePointerSize() == sizeof(FPlatformMemoryImagePtrUInt));\n#endif"
+				},
+				{
+					"\tFFrozenMemoryImagePtr FrozenPtr;\n\tFrozenPtr.Packed = 0; // dummy value\n\t// If derived type matches the static type, store INDEX_NONE to indicate the static type may be used\n\tFrozenPtr.SetTypeIndex(bStaticTypeMatchesDerived ? INDEX_NONE : TypeDependencyIndex);\n\n\tSectionPointer.Offset = WriteBytes(FrozenPtr);",
+					"#if SIMPLYSTREAM_MEMORY32\n\tif (ParentImage->TargetLayoutParameters.GetMemoryImagePointerSize() == sizeof(uint32))\n\t{\n\t\tconst FFrozenMemoryImagePtr32 FrozenPtr{ 0u };\n\t\tSectionPointer.Offset = WriteBytes(FrozenPtr);\n\t}\n\telse\n#endif\n\t{\n\t\tFFrozenMemoryImagePtr FrozenPtr;\n\t\tFrozenPtr.Packed = 0; // dummy value\n\t\t// If derived type matches the static type, store INDEX_NONE to indicate the static type may be used\n\t\tFrozenPtr.SetTypeIndex(bStaticTypeMatchesDerived ? INDEX_NONE : TypeDependencyIndex);\n\t\tSectionPointer.Offset = WriteBytes(FrozenPtr);\n\t}"
+				},
+				{
+					"uint32 FMemoryImageSection::WriteRawPointerSizedBytes(uint64 PointerValue)\n{\n\tif (ParentImage->TargetLayoutParameters.Is32Bit())\n\t{\n\t\treturn WriteBytes((uint32)PointerValue);\n\t}\n\telse\n\t{\n\t\treturn WriteBytes(PointerValue);\n\t}\n}",
+					"uint32 FMemoryImageSection::WriteRawPointerSizedBytes(uint64 PointerValue)\n{\n\tif (ParentImage->TargetLayoutParameters.Is32Bit())\n\t{\n\t\treturn WriteBytes((uint32)PointerValue);\n\t}\n\telse\n\t{\n\t\treturn WriteBytes(PointerValue);\n\t}\n}\n\n#if SIMPLYSTREAM_MEMORY32\nuint32 FMemoryImageSection::WriteMemoryImagePointerSizedBytes(uint64 PointerValue)\n{\n\tif (ParentImage->TargetLayoutParameters.GetMemoryImagePointerSize() == sizeof(uint32))\n\t{\n\t\tcheck(PointerValue <= MAX_uint32);\n\t\treturn WriteBytes(static_cast<uint32>(PointerValue));\n\t}\n\treturn WriteBytes(PointerValue);\n}\n#endif"
+				},
+				{
+					"\t\tfor (const FMemoryImageSection::FSectionPointer& Pointer : Section->Pointers)\n\t\t{\n\t\t\tconst int64 OffsetToPointer = SectionOffset[SectionIndex] + Pointer.Offset;\n\t\t\tconst int32 RemapSectionIndex = SectionIndexRemap[Pointer.SectionIndex];\n\t\t\tFFrozenMemoryImagePtr* FrozenPtr = (FFrozenMemoryImagePtr*)(OutResult.Bytes.GetData() + OffsetToPointer);\n\t\t\tcheck(FrozenPtr->GetOffsetFromThis() == 0 && !FrozenPtr->IsFrozen());\n\t\t\tconst int64 OffsetFromPointer = static_cast<int64>(SectionOffset[RemapSectionIndex]) + static_cast<int64>(Pointer.PointerOffset) - OffsetToPointer;\n\t\t\tFrozenPtr->SetOffsetFromThis(OffsetFromPointer);\n\t\t\tFrozenPtr->SetIsFrozen(true);\n\t\t\tcheck(FrozenPtr->GetOffsetFromThis() == OffsetFromPointer);\n\t\t}",
+					"\t\tfor (const FMemoryImageSection::FSectionPointer& Pointer : Section->Pointers)\n\t\t{\n\t\t\tconst int64 OffsetToPointer = SectionOffset[SectionIndex] + Pointer.Offset;\n\t\t\tconst int32 RemapSectionIndex = SectionIndexRemap[Pointer.SectionIndex];\n\t\t\tconst int64 OffsetFromPointer = static_cast<int64>(SectionOffset[RemapSectionIndex]) + static_cast<int64>(Pointer.PointerOffset) - OffsetToPointer;\n#if SIMPLYSTREAM_MEMORY32\n\t\t\tif (TargetLayoutParameters.GetMemoryImagePointerSize() == sizeof(uint32))\n\t\t\t{\n\t\t\t\tFFrozenMemoryImagePtr32* FrozenPtr = reinterpret_cast<FFrozenMemoryImagePtr32*>(OutResult.Bytes.GetData() + OffsetToPointer);\n\t\t\t\tcheck(FrozenPtr->GetOffsetFromThis() == 0 && !FrozenPtr->IsFrozen());\n\t\t\t\tFrozenPtr->SetOffsetFromThis(OffsetFromPointer);\n\t\t\t\tFrozenPtr->SetIsFrozen(true);\n\t\t\t\tcheck(FrozenPtr->GetOffsetFromThis() == OffsetFromPointer);\n\t\t\t}\n\t\t\telse\n#endif\n\t\t\t{\n\t\t\t\tFFrozenMemoryImagePtr* FrozenPtr = reinterpret_cast<FFrozenMemoryImagePtr*>(OutResult.Bytes.GetData() + OffsetToPointer);\n\t\t\t\tcheck(FrozenPtr->GetOffsetFromThis() == 0 && !FrozenPtr->IsFrozen());\n\t\t\t\tFrozenPtr->SetOffsetFromThis(OffsetFromPointer);\n\t\t\t\tFrozenPtr->SetIsFrozen(true);\n\t\t\t\tcheck(FrozenPtr->GetOffsetFromThis() == OffsetFromPointer);\n\t\t\t}\n\t\t}"
+				},
+				{
+					"uint32 FMemoryImageWriter::WriteNullPointer()\n{\n\treturn WriteBytes(FFrozenMemoryImagePtr{ 0ull });\n}",
+					"uint32 FMemoryImageWriter::WriteNullPointer()\n{\n#if SIMPLYSTREAM_MEMORY32\n\treturn WriteMemoryImagePointerSizedBytes(0u);\n#else\n\treturn WriteBytes(FFrozenMemoryImagePtr{ 0ull });\n#endif\n}\n\n#if SIMPLYSTREAM_MEMORY32\nuint32 FMemoryImageWriter::WriteMemoryImagePointerSizedBytes(uint64 PointerValue)\n{\n\treturn Section->WriteMemoryImagePointerSizedBytes(PointerValue);\n}\n#endif"
+				},
+				{
+					"\telse\n\t{\n\t\t// Loading content that was frozen for a different platform/configuration, need to convert\n\t\t// This path is only supported if we're tracking type dependencies, otherwise we won't have any TypeDependencies stored in the pointer table, which is required for conversion",
+					"#if SIMPLYSTREAM_MEMORY32\n\telse if (LayoutParameters.GetMemoryImagePointerSize() == sizeof(uint32))\n\t{\n\t\t// Compact pointers do not embed the derived-type index required for cross-layout conversion.\n\t\t// Reject this path explicitly until that metadata has a validated archive sidecar.\n\t\tUE_LOG(LogMemoryImage, Error, TEXT(\"Cross-layout unfreezing of a 32-bit frozen memory image is not supported\"));\n\t\tFMemory::Free(FrozenObject);\n\t\treturn FMemoryImageObject();\n\t}\n#endif\n\telse\n\t{\n\t\t// Loading content that was frozen for a different platform/configuration, need to convert\n\t\t// This path is only supported if we're tracking type dependencies, otherwise we won't have any TypeDependencies stored in the pointer table, which is required for conversion"
+				},
+			}, true);
+			ShadowPatch(ShadowDir, false, "Runtime/Renderer/Private/ShaderBaseClasses.cpp", "Runtime/Renderer/Private/ShaderBaseClasses.cpp", new Dictionary<string, string>
+			{
+				{
+					"\tconst FVertexFactoryType* VertexFactoryType = GetVertexFactoryType(Writer.TryGetPrevPointerTable());\n\tInVertexFactoryParameters.WriteMemoryImageWithDerivedType(Writer, VertexFactoryType->GetShaderParameterLayout(GetFrequency()));",
+					"#if SIMPLYSTREAM_MEMORY32\n\tif (InVertexFactoryParameters.IsNull())\n\t{\n\t\tWriter.WriteNullPointer();\n\t\treturn;\n\t}\n#endif\n\tconst FVertexFactoryType* VertexFactoryType = GetVertexFactoryType(Writer.TryGetPrevPointerTable());\n#if SIMPLYSTREAM_MEMORY32\n\tcheckf(VertexFactoryType, TEXT(\"Converted mesh-material shader has non-null vertex-factory parameters but no resolved vertex-factory type\"));\n\tconst FTypeLayoutDesc* VertexFactoryParameterLayout = VertexFactoryType->GetShaderParameterLayout(GetFrequency());\n\tif (!VertexFactoryParameterLayout)\n\t{\n\t\t// An unregistered frequency has no parameter constructor or bindings. Cross-layout\n\t\t// conversion can expose non-zero archived padding here; normalize it to target null.\n\t\tWriter.WriteNullPointer();\n\t\treturn;\n\t}\n\tInVertexFactoryParameters.WriteMemoryImageWithDerivedType(Writer, VertexFactoryParameterLayout);\n#else\n\tInVertexFactoryParameters.WriteMemoryImageWithDerivedType(Writer, VertexFactoryType->GetShaderParameterLayout(GetFrequency()));\n#endif"
+				},
+			}, true);
+			FileReference PlatformHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/HAL/Platform.h");
+			FileReference PlatformShadow = FileReference.Combine(ShadowDir, "HAL/Platform.h");
+			FileReference ScalabilityHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Engine/Public/Scalability.h");
+			FileReference ScalabilityHeaderShadow = FileReference.Combine(ShadowDir, "Scalability.h");
+			FileReference ShaderParameterHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/RenderCore/Public/ShaderParameterMacros.h");
+			FileReference ShaderParameterShadow = FileReference.Combine(ShadowDir, "ShaderParameterMacros.h");
+			FileReference DescriptorRangeHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/RHI/Public/RHIDescriptorRange.h");
+			FileReference DescriptorRangeShadow = FileReference.Combine(ShadowDir, "RHIDescriptorRange.h");
+			FileReference SlateAttributeHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/SlateCore/Public/Types/SlateAttributeDescriptor.h");
+			FileReference SlateAttributeHeaderShadow = FileReference.Combine(ShadowDir, "Types/SlateAttributeDescriptor.h");
+			FileReference SlateAttributeSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/SlateCore/Private/Types/SlateAttributeDescriptor.cpp");
+			FileReference SlateAttributeSourceShadow = FileReference.Combine(ShadowDir, "Runtime/SlateCore/Private/Types/SlateAttributeDescriptor.cpp");
+			FileReference ContainerAllocationHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/Containers/ContainerAllocationPolicies.h");
+			FileReference ContainerAllocationShadow = FileReference.Combine(ShadowDir, "Containers/ContainerAllocationPolicies.h");
+			FileReference ArrayHeaderShadow = FileReference.Combine(ShadowDir, "Containers/Array.h");
+			FileReference HashTableHeaderShadow = FileReference.Combine(ShadowDir, "Containers/HashTable.h");
+			FileReference TupleHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/Templates/Tuple.h");
+			FileReference TupleHeaderShadow = FileReference.Combine(ShadowDir, "Templates/Tuple.h");
+			FileReference MemoryImageHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/Serialization/MemoryImage.h");
+			FileReference MemoryImageHeaderShadow = FileReference.Combine(ShadowDir, "Serialization/MemoryImage.h");
+			FileReference MemoryImageWriterHeaderShadow = FileReference.Combine(ShadowDir, "Serialization/MemoryImageWriter.h");
+			FileReference MemoryLayoutHeaderShadow = FileReference.Combine(ShadowDir, "Serialization/MemoryLayout.h");
+			FileReference MemoryImageSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Private/Serialization/MemoryImage.cpp");
+			FileReference MemoryImageSourceShadow = FileReference.Combine(ShadowDir, "Runtime/Core/Private/Serialization/MemoryImage.cpp");
+			FileReference ShaderBaseClassesSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Renderer/Private/ShaderBaseClasses.cpp");
+			FileReference ShaderBaseClassesSourceShadow = FileReference.Combine(ShadowDir, "Runtime/Renderer/Private/ShaderBaseClasses.cpp");
+			FileReference ReferenceTokenHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/CoreUObject/Public/UObject/ReferenceToken.h");
+			FileReference ReferenceTokenShadow = FileReference.Combine(ShadowDir, "UObject/ReferenceToken.h");
+			FileReference MemoryArenaHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/Memory/MemoryArena.h");
+			FileReference MemoryArenaShadow = FileReference.Combine(ShadowDir, "Memory/MemoryArena.h");
+			FileReference TaskHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Public/Async/Fundamental/Task.h");
+			FileReference TaskShadow = FileReference.Combine(ShadowDir, "Async/Fundamental/Task.h");
+			FileReference ParkingLotSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Private/Async/ParkingLot.cpp");
+			FileReference ParkingLotShadow = FileReference.Combine(ShadowDir, "Runtime/Core/Private/Async/ParkingLot.cpp");
+			FileReference UdpSegmenterTestSource = FileReference.Combine(Unreal.EngineDirectory, "Plugins/Messaging/UdpMessaging/Source/UdpMessaging/Private/Tests/UdpMessageSegmenterTest.cpp");
+			FileReference UdpSegmenterTestShadow = FileReference.Combine(ShadowDir, "Plugins/Messaging/UdpMessaging/Private/Tests/UdpMessageSegmenterTest.cpp");
+			FileReference OpenXRHmdSource = FileReference.Combine(Unreal.EngineDirectory, "Plugins/Runtime/OpenXR/Source/OpenXRHMD/Private/OpenXRHMD.cpp");
+			FileReference OpenXRHmdShadow = FileReference.Combine(ShadowDir, "Plugins/Runtime/OpenXR/OpenXRHMD/Private/OpenXRHMD.cpp");
+			FileReference StormSyncClientTestSource = FileReference.Combine(Unreal.EngineDirectory, "Plugins/VirtualProduction/StormSync/Source/StormSyncTransportClient/Private/Tests/StormSyncTransportClientEndpoint.spec.cpp");
+			FileReference StormSyncClientTestShadow = FileReference.Combine(ShadowDir, "Plugins/VirtualProduction/StormSync/StormSyncTransportClient/Private/Tests/StormSyncTransportClientEndpoint.spec.cpp");
+			FileReference StormSyncCoreTestSource = FileReference.Combine(Unreal.EngineDirectory, "Plugins/VirtualProduction/StormSync/Source/StormSyncTransportCore/Private/Tests/StormSyncTransportMessages.spec.cpp");
+			FileReference StormSyncCoreTestShadow = FileReference.Combine(ShadowDir, "Plugins/VirtualProduction/StormSync/StormSyncTransportCore/Private/Tests/StormSyncTransportMessages.spec.cpp");
+			FileReference MutableCodeRunnerHeader = FileReference.Combine(Unreal.EngineDirectory, "Plugins/Mutable/Source/MutableRuntime/Private/MuR/CodeRunner.h");
+			FileReference MutableCodeRunnerShadow = FileReference.Combine(ShadowDir, "MuR/CodeRunner.h");
+			FileReference AssetDataMapSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/AssetRegistry/Private/AssetDataMap.cpp");
+			FileReference AssetDataMapShadow = FileReference.Combine(ShadowDir, "Runtime/AssetRegistry/Private/AssetDataMap.cpp");
+			FileReference PlatformIoHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Internal/IO/PlatformIoDispatcherBase.h");
+			FileReference PlatformIoShadow = FileReference.Combine(ShadowDir, "IO/PlatformIoDispatcherBase.h");
+			FileReference MallocBinnedGpuSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Private/HAL/MallocBinnedGPU.cpp");
+			FileReference MallocBinnedGpuShadow = FileReference.Combine(ShadowDir, "Runtime/Core/Private/HAL/MallocBinnedGPU.cpp");
+			FileReference MallocBinned3Shadow = FileReference.Combine(ShadowDir, "Runtime/Core/Private/HAL/MallocBinned3.cpp");
+			FileReference SharedBufferSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Core/Private/Memory/SharedBuffer.cpp");
+			FileReference SharedBufferShadow = FileReference.Combine(ShadowDir, "Runtime/Core/Private/Memory/SharedBuffer.cpp");
+			FileReference FastReferenceCollectorShadow = FileReference.Combine(ShadowDir, "UObject/FastReferenceCollector.h");
+			FileReference GarbageCollectionShadow = FileReference.Combine(ShadowDir, "Runtime/CoreUObject/Private/UObject/GarbageCollection.cpp");
+			FileReference GarbageCollectionSchemaSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/CoreUObject/Private/UObject/GarbageCollectionSchema.cpp");
+			FileReference GarbageCollectionSchemaShadow = FileReference.Combine(ShadowDir, "Runtime/CoreUObject/Private/UObject/GarbageCollectionSchema.cpp");
+			FileReference ChaosThreadingHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Experimental/Chaos/Public/Framework/Threading.h");
+			FileReference ChaosThreadingShadow = FileReference.Combine(ShadowDir, "Experimental/Chaos/Public/Framework/Threading.h");
+			FileReference UObjectHashSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/CoreUObject/Private/UObject/UObjectHash.cpp");
+			FileReference UObjectHashShadow = FileReference.Combine(ShadowDir, "Runtime/CoreUObject/Private/UObject/UObjectHash.cpp");
+			FileReference BulkDataHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/CoreUObject/Public/Serialization/BulkData.h");
+			FileReference BulkDataShadow = FileReference.Combine(ShadowDir, "Serialization/BulkData.h");
+			FileReference ChaosScratchHeader = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Experimental/Chaos/Public/Chaos/Framework/ScratchBuffer.h");
+			FileReference ChaosScratchShadow = FileReference.Combine(ShadowDir, "Chaos/Framework/ScratchBuffer.h");
+			FileReference ChaosImplicitSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Experimental/Chaos/Private/Chaos/ImplicitObjectBVH.cpp");
+			FileReference ChaosImplicitShadow = FileReference.Combine(ShadowDir, "Runtime/Experimental/Chaos/Private/Chaos/ImplicitObjectBVH.cpp");
+			FileReference HttpMiscSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Experimental/IoStore/HttpClient/Private/Misc.inl");
+			FileReference HttpMiscShadow = FileReference.Combine(ShadowDir, "Runtime/Experimental/IoStore/HttpClient/Private/Misc.inl");
+			FileReference HttpActivityShadow = FileReference.Combine(ShadowDir, "Runtime/Experimental/IoStore/HttpClient/Private/Activity.inl");
+			FileReference HttpPeerShadow = FileReference.Combine(ShadowDir, "Runtime/Experimental/IoStore/HttpClient/Private/Peer.inl");
+			FileReference HttpTestShadow = FileReference.Combine(ShadowDir, "Runtime/Experimental/IoStore/HttpClient/Private/Test.inl");
+			FileReference JournaledCacheSource = FileReference.Combine(Unreal.EngineSourceDirectory, "Runtime/Experimental/IoStore/OnDemand/Private/JournaledCache.cpp");
+			FileReference JournaledCacheShadow = FileReference.Combine(ShadowDir, "Runtime/Experimental/IoStore/OnDemand/Private/JournaledCache.cpp");
+			FileReference VfsOverlay = FileReference.Combine(ShadowDir, "SimplyStreamVfsOverlay.json");
+			string OverlayText =
+				"{\n" +
+				"  \"version\": 0,\n" +
+				"  \"case-sensitive\": false,\n" +
+				"  \"roots\": [\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + PlatformHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"Platform.h\", \"external-contents\": \"" + PlatformShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ScalabilityHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"Scalability.h\", \"external-contents\": \"" + ScalabilityHeaderShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ShaderParameterHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ShaderParameterMacros.h\", \"external-contents\": \"" + ShaderParameterShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + DescriptorRangeHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"RHIDescriptorRange.h\", \"external-contents\": \"" + DescriptorRangeShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + SlateAttributeHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"SlateAttributeDescriptor.h\", \"external-contents\": \"" + SlateAttributeHeaderShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + SlateAttributeSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"SlateAttributeDescriptor.cpp\", \"external-contents\": \"" + SlateAttributeSourceShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ContainerAllocationHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ContainerAllocationPolicies.h\", \"external-contents\": \"" + ContainerAllocationShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"Array.h\", \"external-contents\": \"" + ArrayHeaderShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"HashTable.h\", \"external-contents\": \"" + HashTableHeaderShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + TupleHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"Tuple.h\", \"external-contents\": \"" + TupleHeaderShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + MemoryImageHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"MemoryImage.h\", \"external-contents\": \"" + MemoryImageHeaderShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"MemoryImageWriter.h\", \"external-contents\": \"" + MemoryImageWriterHeaderShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"MemoryLayout.h\", \"external-contents\": \"" + MemoryLayoutHeaderShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ReferenceTokenHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ReferenceToken.h\", \"external-contents\": \"" + ReferenceTokenShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"FastReferenceCollector.h\", \"external-contents\": \"" + FastReferenceCollectorShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + MemoryArenaHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"MemoryArena.h\", \"external-contents\": \"" + MemoryArenaShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + TaskHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"Task.h\", \"external-contents\": \"" + TaskShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ParkingLotSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ParkingLot.cpp\", \"external-contents\": \"" + ParkingLotShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + MemoryImageSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"MemoryImage.cpp\", \"external-contents\": \"" + MemoryImageSourceShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ShaderBaseClassesSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ShaderBaseClasses.cpp\", \"external-contents\": \"" + ShaderBaseClassesSourceShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + UdpSegmenterTestSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"UdpMessageSegmenterTest.cpp\", \"external-contents\": \"" + UdpSegmenterTestShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + OpenXRHmdSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"OpenXRHMD.cpp\", \"external-contents\": \"" + OpenXRHmdShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + StormSyncClientTestSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"StormSyncTransportClientEndpoint.spec.cpp\", \"external-contents\": \"" + StormSyncClientTestShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + StormSyncCoreTestSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"StormSyncTransportMessages.spec.cpp\", \"external-contents\": \"" + StormSyncCoreTestShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + MutableCodeRunnerHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"CodeRunner.h\", \"external-contents\": \"" + MutableCodeRunnerShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + AssetDataMapSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"AssetDataMap.cpp\", \"external-contents\": \"" + AssetDataMapShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + PlatformIoHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"PlatformIoDispatcherBase.h\", \"external-contents\": \"" + PlatformIoShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + MallocBinnedGpuSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"MallocBinnedGPU.cpp\", \"external-contents\": \"" + MallocBinnedGpuShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"MallocBinned3.cpp\", \"external-contents\": \"" + MallocBinned3Shadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + SharedBufferSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"SharedBuffer.cpp\", \"external-contents\": \"" + SharedBufferShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + UObjectHashSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"UObjectHash.cpp\", \"external-contents\": \"" + UObjectHashShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"GarbageCollection.cpp\", \"external-contents\": \"" + GarbageCollectionShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"GarbageCollectionSchema.cpp\", \"external-contents\": \"" + GarbageCollectionSchemaShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ChaosThreadingHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"Threading.h\", \"external-contents\": \"" + ChaosThreadingShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + BulkDataHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"BulkData.h\", \"external-contents\": \"" + BulkDataShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ChaosScratchHeader.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ScratchBuffer.h\", \"external-contents\": \"" + ChaosScratchShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + HttpMiscSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"Misc.inl\", \"external-contents\": \"" + HttpMiscShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"Activity.inl\", \"external-contents\": \"" + HttpActivityShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"Peer.inl\", \"external-contents\": \"" + HttpPeerShadow.FullName.Replace("\\", "/") + "\"},\n" +
+				"      {\"type\": \"file\", \"name\": \"Test.inl\", \"external-contents\": \"" + HttpTestShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + JournaledCacheSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"JournaledCache.cpp\", \"external-contents\": \"" + JournaledCacheShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]},\n" +
+				"    {\"type\": \"directory\", \"name\": \"" + ChaosImplicitSource.Directory.FullName.Replace("\\", "/") + "\", \"contents\": [\n" +
+				"      {\"type\": \"file\", \"name\": \"ImplicitObjectBVH.cpp\", \"external-contents\": \"" + ChaosImplicitShadow.FullName.Replace("\\", "/") + "\"}\n" +
+				"    ]}\n" +
+				"  ]\n" +
+				"}\n";
+			if (!FileReference.Exists(VfsOverlay) || File.ReadAllText(VfsOverlay.FullName) != OverlayText)
+			{
+				File.WriteAllText(VfsOverlay.FullName, OverlayText);
+			}
+			bWasmShadowHeadersGenerated = true;
+			return ShadowDir;
+		}
+
+		// IncludeRelPath mirrors how the header is #included (e.g. "Math/UnrealMathNeon.h" or "AtomicQueue.h"),
+		// so the patched copy resolves before the real one on the include search path.
+		void ShadowPatch(DirectoryReference ShadowDir, bool bSystem, string EngineRelPath, string IncludeRelPath, Dictionary<string, string> Replacements, bool bRequireAllReplacements = false)
+		{
+			FileReference Src = FileReference.Combine(Unreal.EngineSourceDirectory, EngineRelPath);
+			if (!FileReference.Exists(Src))
+			{
+				if (bRequireAllReplacements)
+				{
+					throw new BuildException($"Required SimplyStream shadow source is missing: {Src.FullName}");
+				}
+				return;
+			}
+			string Text = File.ReadAllText(Src.FullName);
+			foreach (KeyValuePair<string, string> R in Replacements)
+			{
+				if (bRequireAllReplacements && !Text.Contains(R.Key, StringComparison.Ordinal))
+				{
+					throw new BuildException($"Required SimplyStream shadow anchor was not found in {Src.FullName}: {R.Key}");
+				}
+				Text = Text.Replace(R.Key, R.Value);
+			}
+			// System (ThirdParty) headers go in a `sys` subdir mapped via -isystem so their pre-existing
+			// warnings (e.g. -Wundef on `#if _MSC_VER`) stay suppressed; Core headers go in the -iquote root.
+			DirectoryReference TargetRoot = bSystem ? DirectoryReference.Combine(ShadowDir, "sys") : ShadowDir;
+			FileReference Dst = FileReference.Combine(TargetRoot, IncludeRelPath);
+			Directory.CreateDirectory(Dst.Directory.FullName);
+			if (!FileReference.Exists(Dst) || File.ReadAllText(Dst.FullName) != Text)
+			{
+				File.WriteAllText(Dst.FullName, Text);
+			}
+		}
+
+		// wndr 5.8/wasm: a shadow that does NOT copy the engine header but #includes it (by absolute path, so it
+		// dedupes with the real header via #pragma-once file identity) and appends extra content. Used to inject
+		// declarations a #pragma-once header needs (e.g. HairStrands explicit StaticType specializations) without
+		// double-defining everything in the real header.
+		void ShadowWrap(DirectoryReference ShadowDir, bool bSystem, string EngineRelPath, string IncludeRelPath, string AppendContent)
+		{
+			FileReference Src = FileReference.Combine(Unreal.EngineSourceDirectory, EngineRelPath);
+			if (!FileReference.Exists(Src))
+			{
+				return;
+			}
+			string Text = "#pragma once\n#include \"" + Src.FullName.Replace("\\", "/") + "\"\n" + AppendContent;
+			DirectoryReference TargetRoot = bSystem ? DirectoryReference.Combine(ShadowDir, "sys") : ShadowDir;
+			FileReference Dst = FileReference.Combine(TargetRoot, IncludeRelPath);
+			Directory.CreateDirectory(Dst.Directory.FullName);
+			if (!FileReference.Exists(Dst) || File.ReadAllText(Dst.FullName) != Text)
+			{
+				File.WriteAllText(Dst.FullName, Text);
+			}
+		}
+
+		public void AddIncludePath(ref string Arguments, DirectoryReference IncludePath)
+		{
+			if(IncludePath.IsUnderDirectory(Unreal.EngineDirectory))
+			{
+				Arguments += string.Format(" -I\"{0}\"", IncludePath.MakeRelativeTo(Unreal.EngineSourceDirectory));
+			}
+			else
+			{
+				Arguments += string.Format(" -I\"{0}\"", IncludePath);
+			}
+		}
+
+		protected override CPPOutput CompileCPPFiles(CppCompileEnvironment CompileEnvironment, IEnumerable<FileItem> InputFiles, DirectoryReference OutputDir, string ModuleName, IActionGraphBuilder Graph)
+		{
+			// WORKAROUND: On Mac hosts, clang's SLP vectorizer emits `v128.load64_zero`
+			// with an i32 address inside ZSTD's HUF_decompress4X1_usingDTable_internal_fast_c_loop
+			// (pure-C fast path). Binaryen's --memory64-lowering pass (invoked when
+			// memoryMode=Memory64_Emulated) fails to promote that address to i64, producing
+			// a wasm-validator error. Windows-host clang does not make the same SLP decision,
+			// so Windows builds of the identical source never hit this. Disable the SLP
+			// vectorizer just for WndrZSTD, just on Mac hosts — preserves explicit SIMD in
+			// xxhash.h and all auto-vectorization in every other module.
+			if (ModuleName == "WndrZSTD" && BuildHostPlatform.Current.Platform == UnrealTargetPlatform.Mac)
+			{
+				CompileEnvironment = new CppCompileEnvironment(CompileEnvironment);
+				CompileEnvironment.AdditionalArguments += " -fno-slp-vectorize";
+			}
+
+			// IP protection: force proprietary modules to finalized wasm objects (not LTO
+			// bitcode). Append the complete negative override LAST so Clang does not apply
+			// whole-program vtable transforms to a finalized object. Other modules are untouched.
+			if (NoLtoModules.Contains(ModuleName))
+			{
+				CompileEnvironment = new CppCompileEnvironment(CompileEnvironment);
+				CompileEnvironment.AdditionalArguments +=
+					" -fno-lto -fno-whole-program-vtables -fno-force-emit-vtables";
+			}
+
+			// Platform releases preserve the producer Intermediate. Bump this epoch whenever a Core source-shadow
+			// hook is added or removed so UBT cannot reuse an object previously produced through a different input
+			// path but written to the same output slot. The define is intentionally unused: it invalidates the
+			// compile action while leaving the stock Core source and generated IR unchanged.
+			if (ModuleName == "Core")
+			{
+				CompileEnvironment = new CppCompileEnvironment(CompileEnvironment);
+				CompileEnvironment.AdditionalArguments += $" -DSIMPLYSTREAM_CORE_OBJECT_EPOCH={Memory32CompatibilityEpoch}";
+			}
+
+			// Unity blobs are generated through asynchronous WriteFileIfChanged tasks. The patches below
+			// inspect those files immediately, so wait for the planned contents to reach disk instead of
+			// accidentally cloning a stale blob from the previous build graph.
+			if ((ModuleName == "Renderer" || ModuleName == "RenderCore" || ModuleName == "IoStoreOnDemand") && Graph is TargetMakefileBuilder MakefileBuilder)
+			{
+				MakefileBuilder.WaitOnWriteTasks();
+			}
+
+			// [SimplyStream build-time engine patch] FFT-bloom kernel load loop. We never edit engine
+			// sources; the platform toolchain patches this ONE translation unit at build time instead.
+			// SceneRendering.cpp gates the FFT kernel-texture load on `BloomMethod == BM_FFT` alone —
+			// it never consults DoesPlatformSupportFFTBloom. SimplyStream declares bSupportsFFTBloom=false
+			// (WGSL workgroup limits) and deliberately excludes /Engine/EngineMaterials/DefaultBloomKernel
+			// from staging ([ExcludeContentForMobile]), so any view whose post-process volume selects
+			// convolution bloom made the renderer SYNC-LOAD-RETRY the missing 4MB kernel EVERY FRAME
+			// (per-frame "FlushAsyncLoading(N): 1 QueuedPackages" spam + a per-frame hitch). Dead-gating
+			// the block is exactly correct for this toolchain: it only ever compiles SimplyStream (wasm)
+			// targets, where FFT bloom can never run. Fails the BUILD loudly if the engine snippet drifts.
+			// Stock distance-field streaming also forwards every always-loaded lowest mip before consulting
+			// its per-frame upload budget. Large maps can therefore request a power-of-two 1GB staging buffer
+			// in wasm and bind it beyond WebGPU's storage-buffer limit. Queue those mips through the budgeted
+			// request path instead; streamed bulk requests retain their existing I/O ownership semantics.
+			if (ModuleName == "Renderer")
+			{
+				InputFiles = PatchRendererSources(InputFiles, OutputDir, Graph);
+			}
+
+			// [SimplyStream build-time engine patch] Make RenderCore's RHI validation access windows
+			// composable. The process-global bool cannot represent overlapping graph execution and temporary
+			// uniform-buffer scopes: one scope can restore false while another graph's parallel setup tasks
+			// still need access, causing false failures in FinalizeResources and CreateUniformBuffers.
+			// Also route legacy shader-preload completion tasks to the separate RHI thread. Otherwise RDG
+			// parallel-pass tasks can occupy every generic worker and then deadlock waiting for preload tasks
+			// queued to that same exhausted pool.
+			if (ModuleName == "RenderCore")
+			{
+				InputFiles = PatchRenderCoreSources(InputFiles, OutputDir, Graph);
+			}
+
+			// [SimplyStream build-time engine patch] Preserve precise Shipping startup boundaries around the
+			// OnDemand store's delegate additions, and keep package streaming enabled in Shipping. Stock IAS
+			// requires install handles in Shipping, but SimplyStream is a stateless CDN streaming platform: the
+			// mounted package store must expose cooked packages and fetch their chunks only when LoadPackage asks.
+			if (ModuleName == "IoStoreOnDemand")
+			{
+				InputFiles = PatchIoStoreOnDemandSources(InputFiles, OutputDir, Graph);
+			}
+
+			CPPOutput Result = base.CompileCPPFiles(CompileEnvironment, InputFiles, OutputDir, ModuleName, Graph);
+			return Result;
+		}
+
+		const string FFTBloomAnchor = "if (ViewInfo->FinalPostProcessSettings.BloomMethod == EBloomMethod::BM_FFT && ViewInfo->ViewState != nullptr)";
+		const string FFTBloomPatched = "if (false /* [SimplyStream build-time patch] FFT bloom unsupported (bSupportsFFTBloom=false) and DefaultBloomKernel is excluded from staging; without this gate the renderer sync-load-retries the missing kernel every frame. Patched by SimplyStreamToolChain.cs */ && ViewInfo->FinalPostProcessSettings.BloomMethod == EBloomMethod::BM_FFT && ViewInfo->ViewState != nullptr)";
+		const string DistanceFieldInitialMipQueueAnchor =
+			"\t// At this point DistanceFieldAssetMipAdds contains only lowest resolution mip adds which are always loaded\n" +
+			"\t// Forward these to the Requests to Upload list, with a null BulkData\n" +
+			"\tfor (FDistanceFieldAssetMipId AssetMipAdd : DistanceFieldAssetMipAdds)\n" +
+			"\t{\n" +
+			"\t\tconst FDistanceFieldAssetState& AssetState = AssetStateArray[AssetMipAdd.AssetId];\n" +
+			"\t\tconst int32 ReversedMipIndex = AssetMipAdd.ReversedMipIndex;\n" +
+			"\t\tcheck(ReversedMipIndex == 0);\n" +
+			"\t\tconst int32 MipIndex = AssetState.BuiltData->Mips.Num() - ReversedMipIndex - 1;\n" +
+			"\t\tconst FSparseDistanceFieldMip& MipBuiltData = AssetState.BuiltData->Mips[MipIndex];\n" +
+			"\t\tTextureUploadBytes += MipBuiltData.NumDistanceFieldBricks * BrickSizeBytes;\n\n" +
+			"\t\tFDistanceFieldReadRequest NewReadRequest;\n" +
+			"\t\tNewReadRequest.AssetSetId = AssetMipAdd.AssetId;\n" +
+			"\t\tNewReadRequest.BuiltDataId = AssetState.BuiltData->GetId();\n" +
+			"\t\tNewReadRequest.ReversedMipIndex = AssetMipAdd.ReversedMipIndex;\n" +
+			"\t\tNewReadRequest.NumDistanceFieldBricks = MipBuiltData.NumDistanceFieldBricks;\n" +
+			"\t\tNewReadRequest.AlwaysLoadedDataPtr = AssetState.BuiltData->AlwaysLoadedMip.GetData();\n" +
+			"\t\tNewReadRequest.BulkSize = AssetState.BuiltData->AlwaysLoadedMip.Num();\n" +
+			"\t\tReadRequestsToUpload.Add(MoveTemp(NewReadRequest));\n" +
+			"\t}";
+		const string DistanceFieldInitialMipQueuePatched =
+			"\t// [SimplyStream build-time patch] Queue always-loaded lowest mips with streamed mips so the existing\n" +
+			"\t// per-frame texture upload limit also bounds WebGPU staging-buffer size and storage binding range.\n" +
+			"\tTArray<FDistanceFieldAssetMipId> InitialMipAdds = MoveTemp(DistanceFieldAssetMipAdds);\n" +
+			"\tDistanceFieldAssetMipAdds.Reset();\n" +
+			"\tfor (FDistanceFieldAssetMipId AssetMipAdd : InitialMipAdds)\n" +
+			"\t{\n" +
+			"\t\tconst FDistanceFieldAssetState& AssetState = AssetStateArray[AssetMipAdd.AssetId];\n" +
+			"\t\tconst int32 ReversedMipIndex = AssetMipAdd.ReversedMipIndex;\n" +
+			"\t\tcheck(ReversedMipIndex == 0);\n" +
+			"\t\tconst int32 MipIndex = AssetState.BuiltData->Mips.Num() - ReversedMipIndex - 1;\n" +
+			"\t\tconst FSparseDistanceFieldMip& MipBuiltData = AssetState.BuiltData->Mips[MipIndex];\n\n" +
+			"\t\tFDistanceFieldReadRequest NewReadRequest;\n" +
+			"\t\tNewReadRequest.AssetSetId = AssetMipAdd.AssetId;\n" +
+			"\t\tNewReadRequest.BuiltDataId = AssetState.BuiltData->GetId();\n" +
+			"\t\tNewReadRequest.ReversedMipIndex = AssetMipAdd.ReversedMipIndex;\n" +
+			"\t\tNewReadRequest.NumDistanceFieldBricks = MipBuiltData.NumDistanceFieldBricks;\n" +
+			"\t\tNewReadRequest.AlwaysLoadedDataPtr = AssetState.BuiltData->AlwaysLoadedMip.GetData();\n" +
+			"\t\tNewReadRequest.BulkSize = AssetState.BuiltData->AlwaysLoadedMip.Num();\n" +
+			"\t\tReadRequests.Add(MoveTemp(NewReadRequest));\n" +
+			"\t}";
+		const string DistanceFieldReadinessAnchor =
+			"#if !WITH_EDITOR\n" +
+			"\t\tif (ReadRequest.AsyncRequest)\n" +
+			"\t\t{\n" +
+			"\t\t\tbReady = bReady && ReadRequest.AsyncRequest->PollCompletion();\n" +
+			"\t\t}\n" +
+			"\t\telse\n" +
+			"\t\t{\n" +
+			"\t\t\tbReady = bReady && ReadRequest.Request.Status().IsCompleted();\n" +
+			"\t\t}\n" +
+			"#endif";
+		const string DistanceFieldReadinessPatched =
+			"#if !WITH_EDITOR\n" +
+			"\t\t// [SimplyStream build-time patch] Always-loaded requests have no I/O completion object.\n" +
+			"\t\tif (ReadRequest.BulkData)\n" +
+			"\t\t{\n" +
+			"\t\t\tif (ReadRequest.AsyncRequest)\n" +
+			"\t\t\t{\n" +
+			"\t\t\t\tbReady = bReady && ReadRequest.AsyncRequest->PollCompletion();\n" +
+			"\t\t\t}\n" +
+			"\t\t\telse\n" +
+			"\t\t\t{\n" +
+			"\t\t\t\tbReady = bReady && ReadRequest.Request.Status().IsCompleted();\n" +
+			"\t\t\t}\n" +
+			"\t\t}\n" +
+			"#endif";
+		const string DistanceFieldCleanupAnchor = "\t\t\tReadRequestsToCleanUp.Add(ReadRequest);";
+		const string DistanceFieldCleanupPatched =
+			"\t\t\t// [SimplyStream build-time patch] Only bulk-I/O requests own handles or output memory.\n" +
+			"\t\t\tif (ReadRequest.BulkData)\n" +
+			"\t\t\t{\n" +
+			"\t\t\t\tReadRequestsToCleanUp.Add(ReadRequest);\n" +
+			"\t\t\t}";
+		const string RDGValidationStateAnchor =
+			"\t\t\t// It's safe to reset the access to false because validation won't allow this call during execution.\n" +
+			"\t\t\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(true, std::memory_order_relaxed));\n" +
+			"\t\t\tUniformBuffer->InitRHI();\n" +
+			"\t\t\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(false, std::memory_order_relaxed));";
+		const string RDGValidationStatePatched =
+			"\t\t\t// [SimplyStream build-time patch] Use a composable scope instead of clobbering Execute's global bool.\n" +
+			"\t\t\tIF_RDG_ENABLE_DEBUG(GSimplyStreamRDGAllowRHIAccessDepth.fetch_add(1, std::memory_order_relaxed));\n" +
+			"\t\t\tUniformBuffer->InitRHI();\n" +
+			"\t\t\tIF_RDG_ENABLE_DEBUG(GSimplyStreamRDGAllowRHIAccessDepth.fetch_sub(1, std::memory_order_relaxed));";
+		const string RDGExecuteAccessBeginAnchor =
+			"\tIF_RDG_ENABLE_DEBUG(UserValidation.ValidateExecuteBegin());\n" +
+			"\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(true, std::memory_order_relaxed));";
+		const string RDGExecuteAccessBeginPatched =
+			"\tIF_RDG_ENABLE_DEBUG(UserValidation.ValidateExecuteBegin());\n" +
+			"\t// [SimplyStream build-time patch] Keep overlapping Execute access windows reference-counted.\n" +
+			"\tIF_RDG_ENABLE_DEBUG(const bool bSimplyStreamTrackExecuteRHIAccess = GRDGValidation);\n" +
+			"\tIF_RDG_ENABLE_DEBUG(if (bSimplyStreamTrackExecuteRHIAccess) { GSimplyStreamRDGAllowRHIAccessDepth.fetch_add(1, std::memory_order_relaxed); });\n" +
+			"\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(true, std::memory_order_relaxed));";
+		const string RDGExecuteAccessSetupEndAnchor =
+			"\tWaitForParallelSetupTasks(ERDGSetupTaskWaitPoint::Execute);\n\n" +
+			"\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(ParallelExecute.IsEnabled(), std::memory_order_relaxed));";
+		const string RDGExecuteAccessSetupEndPatched =
+			"\tWaitForParallelSetupTasks(ERDGSetupTaskWaitPoint::Execute);\n\n" +
+			"\tIF_RDG_ENABLE_DEBUG(if (bSimplyStreamTrackExecuteRHIAccess && !ParallelExecute.IsEnabled()) { GSimplyStreamRDGAllowRHIAccessDepth.fetch_sub(1, std::memory_order_relaxed); });\n" +
+			"\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(ParallelExecute.IsEnabled(), std::memory_order_relaxed));";
+		const string RDGExecuteAccessEndAnchor =
+			"\tIF_RDG_ENABLE_DEBUG(UserValidation.ValidateExecuteEnd());\n" +
+			"\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(false, std::memory_order_relaxed));";
+		const string RDGExecuteAccessEndPatched =
+			"\tIF_RDG_ENABLE_DEBUG(UserValidation.ValidateExecuteEnd());\n" +
+			"\tIF_RDG_ENABLE_DEBUG(if (bSimplyStreamTrackExecuteRHIAccess && ParallelExecute.IsEnabled()) { GSimplyStreamRDGAllowRHIAccessDepth.fetch_sub(1, std::memory_order_relaxed); });\n" +
+			"\tIF_RDG_ENABLE_DEBUG(GRDGAllowRHIAccess.store(false, std::memory_order_relaxed));";
+		const string RDGAccessCounterDefinitionAnchor =
+			"#include \"RenderTracing.h\"\n\n" +
+			"struct FParallelPassSet";
+		const string RDGAccessCounterDefinitionPatched =
+			"#include \"RenderTracing.h\"\n\n" +
+			"#if RDG_ENABLE_DEBUG\n" +
+			"std::atomic<int32> GSimplyStreamRDGAllowRHIAccessDepth{0};\n" +
+			"#endif\n\n" +
+			"struct FParallelPassSet";
+		const string RDGValidationDeclarationAnchor =
+			"#if RDG_ENABLE_DEBUG\n\n" +
+			"namespace";
+		const string RDGValidationDeclarationPatched =
+			"#if RDG_ENABLE_DEBUG\n\n" +
+			"extern std::atomic<int32> GSimplyStreamRDGAllowRHIAccessDepth;\n\n" +
+			"namespace";
+		const string RDGValidationCheckAnchor =
+			"\tcheckf(bAllowRHIAccess || GRDGAllowRHIAccess.load(std::memory_order_relaxed) || GRDGAllowRHIAccessAsync.load(std::memory_order_relaxed),";
+		const string RDGValidationCheckPatched =
+			"\tcheckf(bAllowRHIAccess || GRDGAllowRHIAccess.load(std::memory_order_relaxed) || GRDGAllowRHIAccessAsync.load(std::memory_order_relaxed) || GSimplyStreamRDGAllowRHIAccessDepth.load(std::memory_order_relaxed) > 0,";
+		const string ShaderPreloadTaskThreadAnchor =
+			"\tFORCEINLINE ENamedThreads::Type GetDesiredThread() { return ENamedThreads::AnyNormalThreadNormalTask; }";
+		const string ShaderPreloadTaskThreadPatched =
+			"\tFORCEINLINE ENamedThreads::Type GetDesiredThread()\n" +
+			"\t{\n" +
+			"\t\t// [SimplyStream build-time patch] Keep shader I/O completions off the RDG parallel worker pool.\n" +
+			"\t\treturn IsRunningRHIInSeparateThread() ? ENamedThreads::RHIThread : ENamedThreads::AnyNormalThreadNormalTask;\n" +
+			"\t}";
+		const string IasPlatformMemoryIncludeAnchor = "#include \"HAL/PlatformFileManager.h\"";
+		const string IasPlatformMemoryIncludePatched =
+			"#include \"HAL/PlatformFileManager.h\"\n" +
+			"#include \"HAL/PlatformMemory.h\"\n" +
+			"#include <stdio.h>";
+		const string IasConstructorDelegateAnchor =
+			"\tFEncryptionKeyManager::Get().OnKeyAdded().AddRaw(this, &FOnDemandIoStore::OnEncryptionKeyAdded);";
+		const string IasConstructorDelegatePatched =
+			"\t{ const FPlatformMemoryStats WndrStats = FPlatformMemory::GetStats(); fprintf(stderr, \"[WndrIasInit] ctor key-delegate begin used=%llu avail=%llu\\n\", (unsigned long long)WndrStats.UsedPhysical, (unsigned long long)WndrStats.AvailablePhysical); fflush(stderr); }\n" +
+			"\tFEncryptionKeyManager::Get().OnKeyAdded().AddRaw(this, &FOnDemandIoStore::OnEncryptionKeyAdded);\n" +
+			"\tfprintf(stderr, \"[WndrIasInit] ctor key-delegate done\\n\"); fflush(stderr);";
+		const string IasInitializeEntryAnchor =
+			"FIoStatus FOnDemandIoStore::Initialize()\n{\n\tLLM_SCOPE_BYNAME(TEXT(\"FileSystem/OnDemandIoStore\"));";
+		const string IasInitializeEntryPatched =
+			"FIoStatus FOnDemandIoStore::Initialize()\n{\n\tLLM_SCOPE_BYNAME(TEXT(\"FileSystem/OnDemandIoStore\"));\n" +
+			"\t{ const FPlatformMemoryStats WndrStats = FPlatformMemory::GetStats(); fprintf(stderr, \"[WndrIasInit] initialize begin used=%llu avail=%llu\\n\", (unsigned long long)WndrStats.UsedPhysical, (unsigned long long)WndrStats.AvailablePhysical); fflush(stderr); }";
+		const string IasInstallCacheStatusAnchor =
+			"\tTIoStatusOr<FOnDemandInstallCacheConfig> InstallCacheConfig = Config::TryParseInstallCacheConfig(FCommandLine::Get());\n\n" +
+			"\tFIoStatus InstallCacheStatus = InstallCacheConfig.IsOk() ?\n" +
+			"\t\tInitializeInstallCache(InstallCacheConfig.ValueOrDie()) : InstallCacheConfig.Status();";
+		const string IasInstallCacheStatusPatched =
+			"\tTIoStatusOr<FOnDemandInstallCacheConfig> InstallCacheConfig = Config::TryParseInstallCacheConfig(FCommandLine::Get());\n\n" +
+			"\tfprintf(stderr, \"[WndrIasInit] install-cache config ok=%d\\n\", InstallCacheConfig.IsOk() ? 1 : 0); fflush(stderr);\n" +
+			"\tFIoStatus InstallCacheStatus = InstallCacheConfig.IsOk() ?\n" +
+			"\t\tInitializeInstallCache(InstallCacheConfig.ValueOrDie()) : InstallCacheConfig.Status();\n" +
+			"\tfprintf(stderr, \"[WndrIasInit] install-cache initialize done ok=%d code=%d\\n\", InstallCacheStatus.IsOk() ? 1 : 0, (int)InstallCacheStatus.GetErrorCode()); fflush(stderr);";
+		const string IasHostDelegateAnchor =
+			"\t\tFHttpIoDispatcher::OnHostGroupRegistered().AddRaw(this, &FOnDemandIoStore::OnHostGroupRegistered);";
+		const string IasHostDelegatePatched =
+			"\t\tfprintf(stderr, \"[WndrIasInit] host-group delegate begin\\n\"); fflush(stderr);\n" +
+			"\t\tFHttpIoDispatcher::OnHostGroupRegistered().AddRaw(this, &FOnDemandIoStore::OnHostGroupRegistered);\n" +
+			"\t\tfprintf(stderr, \"[WndrIasInit] host-group delegate done\\n\"); fflush(stderr);";
+		const string IasShippingPackageStreamingAnchor =
+			"bool IsPackageStreamingEnabled()\n" +
+			"{\n" +
+			"#if UE_BUILD_SHIPPING\n" +
+			"\treturn false;\n" +
+			"#else";
+		const string IasShippingPackageStreamingPatched =
+			"bool IsPackageStreamingEnabled()\n" +
+			"{\n" +
+			"#if UE_BUILD_SHIPPING\n" +
+			"\t// [SimplyStream build-time patch] Stream mounted CDN packages on first use in Shipping.\n" +
+			"\treturn true;\n" +
+			"#else";
+
+		/// <summary>
+		/// Swap selected Renderer private sources (compiled directly, or via a unity blob that includes them)
+		/// for patched copies. SceneRendering dead-gates the unsupported FFT-bloom kernel load;
+		/// DistanceFieldStreaming queues initial mip uploads under the normal per-frame byte budget. Copies live in the
+		/// module's intermediate dir; its relative includes resolve through the Renderer module's own include
+		/// paths (Renderer/Private and Internal are UserIncludePaths for the module), and a #line directive
+		/// keeps diagnostics/debug info pointing at the original file.
+		/// </summary>
+		IEnumerable<FileItem> PatchRendererSources(IEnumerable<FileItem> InputFiles, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			FileItem? PatchedSceneRenderingItem = null;
+			FileItem? PatchedDistanceFieldStreamingItem = null;
+			List<FileItem> Output = new List<FileItem>();
+			foreach (FileItem InputFile in InputFiles)
+			{
+				string FileName = InputFile.Location.GetFileName();
+				if (FileName.Equals("SceneRendering.cpp", StringComparison.OrdinalIgnoreCase) &&
+					InputFile.Location.FullName.Replace('\\', '/').Contains("/Runtime/Renderer/Private/"))
+				{
+					PatchedSceneRenderingItem ??= CreatePatchedSceneRendering(InputFile, OutputDir, Graph);
+					Output.Add(PatchedSceneRenderingItem);
+					continue;
+				}
+				if (FileName.Equals("DistanceFieldStreaming.cpp", StringComparison.OrdinalIgnoreCase) &&
+					InputFile.Location.FullName.Replace('\\', '/').Contains("/Runtime/Renderer/Private/"))
+				{
+					PatchedDistanceFieldStreamingItem ??= CreatePatchedDistanceFieldStreaming(InputFile, OutputDir, Graph);
+					Output.Add(PatchedDistanceFieldStreamingItem);
+					continue;
+				}
+				// Unity blob (generated Module.Renderer*.cpp) that includes either patched source: rewrite the
+				// blob copy to include the patched file instead. NOTE the blob's include paths are RELATIVE to
+				// Engine/Source, so match line-by-line with a full path suffix.
+				if (FileName.StartsWith("Module.Renderer", StringComparison.OrdinalIgnoreCase))
+				{
+					string[] BlobLines = File.ReadAllLines(InputFile.Location.FullName);
+					bool bRewrote = false;
+					for (int LineIdx = 0; LineIdx < BlobLines.Length; ++LineIdx)
+					{
+						string Trimmed = BlobLines[LineIdx].TrimStart();
+						if (!Trimmed.StartsWith("#include", StringComparison.Ordinal))
+						{
+							continue;
+						}
+						int Q1 = Trimmed.IndexOf('"');
+						int Q2 = Trimmed.LastIndexOf('"');
+						if (Q1 < 0 || Q2 <= Q1)
+						{
+							continue;
+						}
+						string IncludePath = Trimmed.Substring(Q1 + 1, Q2 - Q1 - 1).Replace('\\', '/');
+						FileItem? IncludeItem = null;
+						if (IncludePath.EndsWith("Runtime/Renderer/Private/SceneRendering.cpp", StringComparison.OrdinalIgnoreCase))
+						{
+							FileItem OriginalItem = FileItem.GetItemByFileReference(FileReference.Combine(
+								Unreal.EngineDirectory, "Source", "Runtime", "Renderer", "Private", "SceneRendering.cpp"));
+							PatchedSceneRenderingItem ??= CreatePatchedSceneRendering(OriginalItem, OutputDir, Graph);
+							IncludeItem = PatchedSceneRenderingItem;
+						}
+						else if (IncludePath.EndsWith("Runtime/Renderer/Private/DistanceFieldStreaming.cpp", StringComparison.OrdinalIgnoreCase))
+						{
+							FileItem OriginalItem = FileItem.GetItemByFileReference(FileReference.Combine(
+								Unreal.EngineDirectory, "Source", "Runtime", "Renderer", "Private", "DistanceFieldStreaming.cpp"));
+							PatchedDistanceFieldStreamingItem ??= CreatePatchedDistanceFieldStreaming(OriginalItem, OutputDir, Graph);
+							IncludeItem = PatchedDistanceFieldStreamingItem;
+						}
+						if (IncludeItem != null)
+						{
+							BlobLines[LineIdx] = "#include \"" + IncludeItem.Location.FullName.Replace('\\', '/') + "\"";
+							bRewrote = true;
+						}
+					}
+					if (bRewrote)
+					{
+						FileReference NewBlobPath = FileReference.Combine(OutputDir, FileName.Replace(".cpp", ".simplystream-renderer.cpp"));
+						FileItem NewBlobItem = Graph.CreateIntermediateTextFile(NewBlobPath, string.Join("\n", BlobLines));
+						Output.Add(NewBlobItem);
+						continue;
+					}
+				}
+				Output.Add(InputFile);
+			}
+			return Output;
+		}
+
+		/// <summary>
+		/// Patched engine-source copies must live OUTSIDE Engine/Intermediate/Build/SimplyStream: the
+		/// precompiled-payload packager only gathers those trees and enforces a no-source policy over them
+		/// (the SDK payload ships objects, never engine source) — a patched source copy inside the module
+		/// intermediate failed the release with "refusing to package — hand-written source file(s)".
+		/// Consumers link -UsePrecompiled and never need the file; producer re-plans regenerate it.
+		/// </summary>
+		static DirectoryReference GetSourcePatchDir(DirectoryReference OutputDir)
+		{
+			string Full = OutputDir.FullName.Replace('\\', '/');
+			const string Needle = "/Intermediate/Build/SimplyStream/";
+			int Idx = Full.IndexOf(Needle, StringComparison.OrdinalIgnoreCase);
+			if (Idx < 0)
+			{
+				throw new BuildException("SimplyStream engine-source patch: cannot derive a payload-external patch dir from '{0}' — update GetSourcePatchDir.", OutputDir);
+			}
+			return new DirectoryReference(Full.Substring(0, Idx) + "/Intermediate/SimplyStreamSourcePatches/" + Full.Substring(Idx + Needle.Length));
+		}
+
+		FileItem CreatePatchedSceneRendering(FileItem OriginalFile, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			string Source = File.ReadAllText(OriginalFile.Location.FullName);
+			int First = Source.IndexOf(FFTBloomAnchor, StringComparison.Ordinal);
+			if (First < 0 || Source.IndexOf(FFTBloomAnchor, First + 1, StringComparison.Ordinal) >= 0)
+			{
+				throw new BuildException(
+					"SimplyStream FFT-bloom build-time patch: expected exactly one occurrence of the anchor in {0} but found {1}. " +
+					"The engine source drifted — update FFTBloomAnchor/FFTBloomPatched in SimplyStreamToolChain.cs " +
+					"(see the [SimplyStream build-time engine patch] comment) or the per-frame DefaultBloomKernel " +
+					"sync-load spam returns silently.",
+					OriginalFile.Location, First < 0 ? "none" : "more than one");
+			}
+			// #line keeps diagnostics + debug info on the original path; the in-line replacement below does
+			// not change the file's line count, so all line numbers stay aligned.
+			string Patched = "#line 1 \"" + OriginalFile.Location.FullName.Replace('\\', '/') + "\"\n" +
+				Source.Replace(FFTBloomAnchor, FFTBloomPatched);
+			FileReference PatchedPath = FileReference.Combine(GetSourcePatchDir(OutputDir), "SceneRendering.simplystream-fftbloom.cpp");
+			return Graph.CreateIntermediateTextFile(PatchedPath, Patched);
+		}
+
+		FileItem CreatePatchedDistanceFieldStreaming(FileItem OriginalFile, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			string Source = File.ReadAllText(OriginalFile.Location.FullName);
+			string[] Anchors = { DistanceFieldInitialMipQueueAnchor, DistanceFieldReadinessAnchor, DistanceFieldCleanupAnchor };
+			foreach (string Anchor in Anchors)
+			{
+				int First = Source.IndexOf(Anchor, StringComparison.Ordinal);
+				if (First < 0 || Source.IndexOf(Anchor, First + 1, StringComparison.Ordinal) >= 0)
+				{
+					throw new BuildException(
+						"SimplyStream distance-field upload build-time patch: expected exactly one occurrence of an anchor in {0}. " +
+						"The engine source drifted; update the DistanceField* anchors in SimplyStreamToolChain.cs.",
+						OriginalFile.Location);
+				}
+			}
+
+			string Patched = "#line 1 \"" + OriginalFile.Location.FullName.Replace('\\', '/') + "\"\n" +
+				Source.Replace(DistanceFieldInitialMipQueueAnchor, DistanceFieldInitialMipQueuePatched)
+					.Replace(DistanceFieldReadinessAnchor, DistanceFieldReadinessPatched)
+					.Replace(DistanceFieldCleanupAnchor, DistanceFieldCleanupPatched);
+			FileReference PatchedPath = FileReference.Combine(GetSourcePatchDir(OutputDir), "DistanceFieldStreaming.simplystream-bounded-upload.cpp");
+			return Graph.CreateIntermediateTextFile(PatchedPath, Patched);
+		}
+
+		/// <summary>
+		/// Swap RenderGraphBuilder.cpp, RenderGraphValidation.cpp, and ShaderCodeArchive.cpp (compiled
+		/// directly or through a unity blob) for SimplyStream-patched copies. The graph sources use a
+		/// composable access counter during graph execution and external uniform-buffer initialization;
+		/// the shader archive routes preload completion off the parallel-render worker pool.
+		/// The source anchor is intentionally exact so an upstream engine change fails the build instead of
+		/// silently dropping either RenderCore fix.
+		/// </summary>
+		IEnumerable<FileItem> PatchRenderCoreSources(IEnumerable<FileItem> InputFiles, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			FileItem? PatchedBuilderItem = null;
+			FileItem? PatchedValidationItem = null;
+			FileItem? PatchedShaderArchiveItem = null;
+			List<FileItem> Output = new List<FileItem>();
+			foreach (FileItem InputFile in InputFiles)
+			{
+				string FileName = InputFile.Location.GetFileName();
+				if (FileName.Equals("RenderGraphBuilder.cpp", StringComparison.OrdinalIgnoreCase) &&
+					InputFile.Location.FullName.Replace('\\', '/').Contains("/Runtime/RenderCore/Private/"))
+				{
+					PatchedBuilderItem ??= CreatePatchedRenderGraphBuilder(InputFile, OutputDir, Graph);
+					Output.Add(PatchedBuilderItem);
+					continue;
+				}
+				if (FileName.Equals("RenderGraphValidation.cpp", StringComparison.OrdinalIgnoreCase) &&
+					InputFile.Location.FullName.Replace('\\', '/').Contains("/Runtime/RenderCore/Private/"))
+				{
+					PatchedValidationItem ??= CreatePatchedRenderGraphValidation(InputFile, OutputDir, Graph);
+					Output.Add(PatchedValidationItem);
+					continue;
+				}
+				if (FileName.Equals("ShaderCodeArchive.cpp", StringComparison.OrdinalIgnoreCase) &&
+					InputFile.Location.FullName.Replace('\\', '/').Contains("/Runtime/RenderCore/Private/ShaderLibrary/"))
+				{
+					PatchedShaderArchiveItem ??= CreatePatchedShaderCodeArchive(InputFile, OutputDir, Graph);
+					Output.Add(PatchedShaderArchiveItem);
+					continue;
+				}
+
+				if (FileName.StartsWith("Module.RenderCore", StringComparison.OrdinalIgnoreCase))
+				{
+					string[] BlobLines = File.ReadAllLines(InputFile.Location.FullName);
+					bool bRewrote = false;
+					for (int LineIdx = 0; LineIdx < BlobLines.Length; ++LineIdx)
+					{
+						string Trimmed = BlobLines[LineIdx].TrimStart();
+						if (!Trimmed.StartsWith("#include", StringComparison.Ordinal))
+						{
+							continue;
+						}
+						int Q1 = Trimmed.IndexOf('"');
+						int Q2 = Trimmed.LastIndexOf('"');
+						if (Q1 < 0 || Q2 <= Q1)
+						{
+							continue;
+						}
+						string IncludePath = Trimmed.Substring(Q1 + 1, Q2 - Q1 - 1).Replace('\\', '/');
+						FileItem? IncludeItem = null;
+						if (IncludePath.EndsWith("Runtime/RenderCore/Private/RenderGraphBuilder.cpp", StringComparison.OrdinalIgnoreCase))
+						{
+							FileItem OriginalItem = FileItem.GetItemByFileReference(FileReference.Combine(
+								Unreal.EngineDirectory, "Source", "Runtime", "RenderCore", "Private", "RenderGraphBuilder.cpp"));
+							PatchedBuilderItem ??= CreatePatchedRenderGraphBuilder(OriginalItem, OutputDir, Graph);
+							IncludeItem = PatchedBuilderItem;
+						}
+						else if (IncludePath.EndsWith("Runtime/RenderCore/Private/RenderGraphValidation.cpp", StringComparison.OrdinalIgnoreCase))
+						{
+							FileItem OriginalItem = FileItem.GetItemByFileReference(FileReference.Combine(
+								Unreal.EngineDirectory, "Source", "Runtime", "RenderCore", "Private", "RenderGraphValidation.cpp"));
+							PatchedValidationItem ??= CreatePatchedRenderGraphValidation(OriginalItem, OutputDir, Graph);
+							IncludeItem = PatchedValidationItem;
+						}
+						else if (IncludePath.EndsWith("Runtime/RenderCore/Private/ShaderLibrary/ShaderCodeArchive.cpp", StringComparison.OrdinalIgnoreCase))
+						{
+							FileItem OriginalItem = FileItem.GetItemByFileReference(FileReference.Combine(
+								Unreal.EngineDirectory, "Source", "Runtime", "RenderCore", "Private", "ShaderLibrary", "ShaderCodeArchive.cpp"));
+							PatchedShaderArchiveItem ??= CreatePatchedShaderCodeArchive(OriginalItem, OutputDir, Graph);
+							IncludeItem = PatchedShaderArchiveItem;
+						}
+						if (IncludeItem == null)
+						{
+							continue;
+						}
+						BlobLines[LineIdx] = "#include \"" + IncludeItem.Location.FullName.Replace('\\', '/') + "\"";
+						bRewrote = true;
+					}
+					if (bRewrote)
+					{
+						FileReference NewBlobPath = FileReference.Combine(OutputDir, FileName.Replace(".cpp", ".simplystream-rendercore.cpp"));
+						FileItem NewBlobItem = Graph.CreateIntermediateTextFile(NewBlobPath, string.Join("\n", BlobLines));
+						Output.Add(NewBlobItem);
+						continue;
+					}
+				}
+				Output.Add(InputFile);
+			}
+			return Output;
+		}
+
+		FileItem CreatePatchedRenderGraphBuilder(FileItem OriginalFile, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			string Source = File.ReadAllText(OriginalFile.Location.FullName);
+			int StateFirst = Source.IndexOf(RDGValidationStateAnchor, StringComparison.Ordinal);
+			int ExecuteBeginFirst = Source.IndexOf(RDGExecuteAccessBeginAnchor, StringComparison.Ordinal);
+			int ExecuteSetupEndFirst = Source.IndexOf(RDGExecuteAccessSetupEndAnchor, StringComparison.Ordinal);
+			int ExecuteEndFirst = Source.IndexOf(RDGExecuteAccessEndAnchor, StringComparison.Ordinal);
+			int DefinitionFirst = Source.IndexOf(RDGAccessCounterDefinitionAnchor, StringComparison.Ordinal);
+			if (StateFirst < 0 || Source.IndexOf(RDGValidationStateAnchor, StateFirst + 1, StringComparison.Ordinal) >= 0 ||
+				ExecuteBeginFirst < 0 || Source.IndexOf(RDGExecuteAccessBeginAnchor, ExecuteBeginFirst + 1, StringComparison.Ordinal) >= 0 ||
+				ExecuteSetupEndFirst < 0 || Source.IndexOf(RDGExecuteAccessSetupEndAnchor, ExecuteSetupEndFirst + 1, StringComparison.Ordinal) >= 0 ||
+				ExecuteEndFirst < 0 || Source.IndexOf(RDGExecuteAccessEndAnchor, ExecuteEndFirst + 1, StringComparison.Ordinal) >= 0 ||
+				DefinitionFirst < 0 || Source.IndexOf(RDGAccessCounterDefinitionAnchor, DefinitionFirst + 1, StringComparison.Ordinal) >= 0)
+			{
+				throw new BuildException(
+					"SimplyStream RDG validation-state build-time patch: expected exactly one occurrence of each anchor in {0}. " +
+					"The engine source drifted — update the RDG validation anchors in SimplyStreamToolChain.cs.",
+					OriginalFile.Location);
+			}
+			string Patched = "#line 1 \"" + OriginalFile.Location.FullName.Replace('\\', '/') + "\"\n" +
+				Source.Replace(RDGAccessCounterDefinitionAnchor, RDGAccessCounterDefinitionPatched)
+					.Replace(RDGValidationStateAnchor, RDGValidationStatePatched)
+					.Replace(RDGExecuteAccessBeginAnchor, RDGExecuteAccessBeginPatched)
+					.Replace(RDGExecuteAccessSetupEndAnchor, RDGExecuteAccessSetupEndPatched)
+					.Replace(RDGExecuteAccessEndAnchor, RDGExecuteAccessEndPatched);
+			FileReference PatchedPath = FileReference.Combine(GetSourcePatchDir(OutputDir), "RenderGraphBuilder.simplystream-rdg-validation.cpp");
+			return Graph.CreateIntermediateTextFile(PatchedPath, Patched);
+		}
+
+		FileItem CreatePatchedShaderCodeArchive(FileItem OriginalFile, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			string Source = File.ReadAllText(OriginalFile.Location.FullName);
+			int ThreadAnchorFirst = Source.IndexOf(ShaderPreloadTaskThreadAnchor, StringComparison.Ordinal);
+			if (ThreadAnchorFirst < 0 || Source.IndexOf(ShaderPreloadTaskThreadAnchor, ThreadAnchorFirst + 1, StringComparison.Ordinal) >= 0)
+			{
+				throw new BuildException(
+					"SimplyStream shader-preload task-thread build-time patch: expected exactly one occurrence of the anchor in {0}. " +
+					"The engine source drifted — update ShaderPreloadTaskThreadAnchor/ShaderPreloadTaskThreadPatched in SimplyStreamToolChain.cs.",
+					OriginalFile.Location);
+			}
+			string Patched = "#line 1 \"" + OriginalFile.Location.FullName.Replace('\\', '/') + "\"\n" +
+				Source.Replace(ShaderPreloadTaskThreadAnchor, ShaderPreloadTaskThreadPatched);
+			FileReference PatchedPath = FileReference.Combine(GetSourcePatchDir(OutputDir), "ShaderCodeArchive.simplystream-preload-rhi.cpp");
+			return Graph.CreateIntermediateTextFile(PatchedPath, Patched);
+		}
+
+		FileItem CreatePatchedRenderGraphValidation(FileItem OriginalFile, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			string Source = File.ReadAllText(OriginalFile.Location.FullName);
+			int DeclarationFirst = Source.IndexOf(RDGValidationDeclarationAnchor, StringComparison.Ordinal);
+			int CheckFirst = Source.IndexOf(RDGValidationCheckAnchor, StringComparison.Ordinal);
+			if (DeclarationFirst < 0 || Source.IndexOf(RDGValidationDeclarationAnchor, DeclarationFirst + 1, StringComparison.Ordinal) >= 0 ||
+				CheckFirst < 0 || Source.IndexOf(RDGValidationCheckAnchor, CheckFirst + 1, StringComparison.Ordinal) >= 0)
+			{
+				throw new BuildException(
+					"SimplyStream RDG validation-check build-time patch: expected exactly one occurrence of each anchor in {0}. " +
+					"The engine source drifted — update the RDG validation anchors in SimplyStreamToolChain.cs.",
+					OriginalFile.Location);
+			}
+			string Patched = "#line 1 \"" + OriginalFile.Location.FullName.Replace('\\', '/') + "\"\n" +
+				Source.Replace(RDGValidationDeclarationAnchor, RDGValidationDeclarationPatched)
+					.Replace(RDGValidationCheckAnchor, RDGValidationCheckPatched);
+			FileReference PatchedPath = FileReference.Combine(GetSourcePatchDir(OutputDir), "RenderGraphValidation.simplystream-rdg-access.cpp");
+			return Graph.CreateIntermediateTextFile(PatchedPath, Patched);
+		}
+
+		IEnumerable<FileItem> PatchIoStoreOnDemandSources(IEnumerable<FileItem> InputFiles, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			FileItem? PatchedItem = null;
+			List<FileItem> Output = new List<FileItem>();
+			foreach (FileItem InputFile in InputFiles)
+			{
+				string FileName = InputFile.Location.GetFileName();
+				if (FileName.Equals("OnDemandIoStore.cpp", StringComparison.OrdinalIgnoreCase) &&
+					InputFile.Location.FullName.Replace('\\', '/').Contains("/Runtime/Experimental/IoStore/OnDemand/Private/"))
+				{
+					PatchedItem ??= CreatePatchedIoStoreOnDemand(InputFile, OutputDir, Graph);
+					Output.Add(PatchedItem);
+					continue;
+				}
+				if (FileName.StartsWith("Module.IoStoreOnDemand", StringComparison.OrdinalIgnoreCase))
+				{
+					string[] BlobLines = File.ReadAllLines(InputFile.Location.FullName);
+					bool bRewrote = false;
+					for (int LineIdx = 0; LineIdx < BlobLines.Length; ++LineIdx)
+					{
+						string Trimmed = BlobLines[LineIdx].TrimStart();
+						if (!Trimmed.StartsWith("#include", StringComparison.Ordinal))
+						{
+							continue;
+						}
+						int Q1 = Trimmed.IndexOf('"');
+						int Q2 = Trimmed.LastIndexOf('"');
+						if (Q1 < 0 || Q2 <= Q1)
+						{
+							continue;
+						}
+						string IncludePath = Trimmed.Substring(Q1 + 1, Q2 - Q1 - 1).Replace('\\', '/');
+						if (!IncludePath.EndsWith("Runtime/Experimental/IoStore/OnDemand/Private/OnDemandIoStore.cpp", StringComparison.OrdinalIgnoreCase))
+						{
+							continue;
+						}
+						FileItem OriginalItem = FileItem.GetItemByFileReference(FileReference.Combine(
+							Unreal.EngineDirectory, "Source", "Runtime", "Experimental", "IoStore", "OnDemand", "Private", "OnDemandIoStore.cpp"));
+						PatchedItem ??= CreatePatchedIoStoreOnDemand(OriginalItem, OutputDir, Graph);
+						BlobLines[LineIdx] = "#include \"" + PatchedItem.Location.FullName.Replace('\\', '/') + "\"";
+						bRewrote = true;
+					}
+					if (bRewrote)
+					{
+						FileReference NewBlobPath = FileReference.Combine(OutputDir, FileName.Replace(".cpp", ".simplystream-ias-diag.cpp"));
+						Output.Add(Graph.CreateIntermediateTextFile(NewBlobPath, string.Join("\n", BlobLines)));
+						continue;
+					}
+				}
+				Output.Add(InputFile);
+			}
+			return Output;
+		}
+
+		FileItem CreatePatchedIoStoreOnDemand(FileItem OriginalFile, DirectoryReference OutputDir, IActionGraphBuilder Graph)
+		{
+			string Source = File.ReadAllText(OriginalFile.Location.FullName);
+			foreach (string Anchor in new[] {
+				IasPlatformMemoryIncludeAnchor,
+				IasConstructorDelegateAnchor,
+				IasInitializeEntryAnchor,
+				IasInstallCacheStatusAnchor,
+				IasHostDelegateAnchor,
+				IasShippingPackageStreamingAnchor,
+			})
+			{
+				int First = Source.IndexOf(Anchor, StringComparison.Ordinal);
+				if (First < 0 || Source.IndexOf(Anchor, First + 1, StringComparison.Ordinal) >= 0)
+				{
+					throw new BuildException(
+						"SimplyStream IoStoreOnDemand build-time patch: expected exactly one occurrence of an anchor in {0}. " +
+						"The engine source drifted; update the IAS diagnostic anchors in SimplyStreamToolChain.cs.",
+						OriginalFile.Location);
+				}
+			}
+			string Patched = "#line 1 \"" + OriginalFile.Location.FullName.Replace('\\', '/') + "\"\n" +
+				Source.Replace(IasPlatformMemoryIncludeAnchor, IasPlatformMemoryIncludePatched)
+					.Replace(IasConstructorDelegateAnchor, IasConstructorDelegatePatched)
+					.Replace(IasInitializeEntryAnchor, IasInitializeEntryPatched)
+					.Replace(IasInstallCacheStatusAnchor, IasInstallCacheStatusPatched)
+					.Replace(IasHostDelegateAnchor, IasHostDelegatePatched)
+					.Replace(IasShippingPackageStreamingAnchor, IasShippingPackageStreamingPatched);
+			FileReference PatchedPath = FileReference.Combine(GetSourcePatchDir(OutputDir), "OnDemandIoStore.simplystream.cpp");
+			return Graph.CreateIntermediateTextFile(PatchedPath, Patched);
+		}
+
+		public override FileItem LinkFiles(LinkEnvironment LinkEnvironment, bool bBuildImportLibraryOnly, IActionGraphBuilder Graph)
+		{
+			FileItem OutputFile;
+			FileReference ToolPath = (LinkEnvironment.bIsBuildingLibrary) ? Info.Archiver : Info.Clang;
+			string ToolVersion = (LinkEnvironment.bIsBuildingLibrary) ? Info.ArchiverVersionString : Info.ClangVersionString;
+
+			Action LinkAction = Graph.CreateAction(ActionType.Link);
+
+			// response file contents
+			List<string> ReponseLines = new List<string>();
+			ReponseLines.Add(GetLinkArguments(LinkEnvironment));
+
+			OutputFile = FileItem.GetItemByFileReference(LinkEnvironment.OutputFilePath);
+			Console.WriteLine("Compiling OutputFile.AbsolutePath. {0}", OutputFile.AbsolutePath);
+			// Non-Development configs append "-SimplyStream-<Config>" after the target name.
+			if (LinkEnvironment.OutputFilePath.GetFileName().Contains("Server") || buildForNode)
+			{
+				OutputFile = FileItem.GetItemByFileReference(LinkEnvironment.OutputFilePath.ChangeExtension(".mjs"));
+				ReponseLines.Add(string.Format(" -sEXPORT_ES6=1 -sMODULARIZE=1 -o \"{0}\"", OutputFile.AbsolutePath));
+			}
+			else
+			{
+				Console.WriteLine("Compiling game wasm. {0}", OutputFile.AbsolutePath);
+				ReponseLines.Add(string.Format(" -o \"{0}\"", OutputFile.AbsolutePath));
+			}
+
+			LinkAction.ProducedItems.Add(OutputFile);
+			ReponseLines.Add(string.Format(" -o \"{0}\"", OutputFile.AbsolutePath));
+
+			//FileItem OutputLink = FileItem.GetItemByPath(LinkEnvironment.OutputFilePath.FullName.Replace(".js", libExt).Replace(".html", libExt));
+			//LinkAction.ProducedItems.Add(OutputLink);
+
+			LinkAction.bCanExecuteRemotelyWithXGE = false;
+			LinkAction.bCanExecuteInUBA = false;
+
+
+			LinkAction.CommandDescription = "Link";
+			LinkAction.WorkingDirectory = Unreal.EngineSourceDirectory;
+			LinkAction.CommandPath = ToolPath;
+			LinkAction.CommandVersion = ToolVersion;
+			LinkAction.CommandArguments = "-v";
+			List<string> InputFileNames = new List<string>();
+			foreach (FileItem InputFile in LinkEnvironment.InputFiles)
+			{
+				ReponseLines.Add($" \"{InputFile}\"");
+				LinkAction.PrerequisiteItems.Add(InputFile);
+			}
+			foreach (FileReference InputFile in LinkEnvironment.Libraries)
+			{
+				if (InputFile.HasExtension(".js"))
+				{
+					ReponseLines.Add($" --js-library \"{InputFile}\"");
+				}
+				else
+				{
+					ReponseLines.Add($" \"{InputFile}\"");
+				}
+				LinkAction.PrerequisiteItems.Add(FileItem.GetItemByFileReference(InputFile));
+			}
+
+			LinkAction.StatusDescription = Path.GetFileName(OutputFile.AbsolutePath);
+
+			FileReference ResponseFileName = GetResponseFileName(LinkEnvironment, OutputFile);
+
+			// this is needed when using EMCC_DEBUG_SAVE
+			if (!FileReference.Exists(ResponseFileName))
+			{
+				DirectoryReference.CreateDirectory(ResponseFileName.Directory);
+			}
+			FileItem ResponseFileItem = Graph.CreateIntermediateTextFile(ResponseFileName, ReponseLines);
+
+			LinkAction.CommandArguments += $" @\"{ResponseFileName}\"";
+			LinkAction.PrerequisiteItems.Add(ResponseFileItem);
+
+			// wndr 5.8/wasm: simplystream.js (--pre-js), simplystream.html (--shell-file) and the setjmp shim
+			// (--js-library) are woven into the .js glue at LINK time, but they are referenced only by PATH in the
+			// link args / response file — their CONTENT is not a tracked input. Without registering them as explicit
+			// prerequisites, UBT will NOT re-link when only the runtime shell changes (the .inl-incremental-miss
+			// trap), so an edited simplystream.js silently never enters the deployed bundle. Track them so any shell
+			// edit always re-links and re-weaves.
+			foreach (string ShellRel in new[] {
+				"/../Platforms/SimplyStream/simplystream.js",
+				"/../Platforms/SimplyStream/simplystream.html",
+				"/../Platforms/SimplyStream/Source/Runtime/Core/Private/SimplyStreamSetjmpShim.js",
+				"/../Platforms/SimplyStream/Source/Runtime/Sockets/Private/SimplyStreamGetaddrinfoShim.js",
+			})
+			{
+				FileReference ShellRef = new FileReference(Directory.GetCurrentDirectory() + ShellRel);
+				if (FileReference.Exists(ShellRef))
+				{
+					LinkAction.PrerequisiteItems.Add(FileItem.GetItemByFileReference(ShellRef));
+				}
+			}
+
+			return OutputFile;
+		}
+
+		public override void ModifyBuildProducts(ReadOnlyTargetRules Target, UEBuildBinary Binary, IEnumerable<string> Libraries, IEnumerable<UEBuildBundleResource> BundleResources, Dictionary<FileReference, BuildProductType> BuildProducts)
+		{
+			Console.WriteLine("ModifyBuildProducts SimplyStreamToolChain with: buildForNode = " + buildForNode + ", Binary = " + Binary.OutputFilePath);
+			if (Target.Type == TargetType.Server || buildForNode)
+			{
+				Console.WriteLine("ModifyBuildProducts SimplyStreamToolChain: Changing extension to .mjs from {Binary.OutputFilePath}");
+				BuildProducts.Remove(Binary.OutputFilePath);
+				BuildProducts.Add(Binary.OutputFilePath.ChangeExtension("mjs"), BuildProductType.RequiredResource);
+			}
+		}
+	};
+}
