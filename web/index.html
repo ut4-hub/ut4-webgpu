@@ -97,6 +97,8 @@ if (/[?&]skinident=1/.test(location.search)) window.__wndrExtraArgs = ["-WndrSki
 // Start map: ?menu=1 -> main menu (UT-Entry), ?map=chill -> straight into DM-Chill.
 window.__wndrMap = /[?&]map=chill/.test(location.search) ? "/Game/RestrictedAssets/Maps/DM-Chill?Game=/Script/UnrealTournament.UTDMGameMode?NumBots=1?quickstart=1"
   : (/[?&]menu=1/.test(location.search) || false) ? "/Game/RestrictedAssets/Maps/UT-Entry" : "/Game/RestrictedAssets/Maps/DM-Chill?Game=/Script/UnrealTournament.UTDMGameMode?NumBots=1?quickstart=1";
+// Content packs (.data) from GitHub via the ut4-packs Worker (saves homelab bandwidth).
+window.__wndrPkgBase = /[?&]pkgs=cdn/.test(location.search) ? "https://ut4-packs.pick.haus/packs-2026-10-12/" : "";
 var Module = {
   canvas: __c,
   arguments: [window.__wndrMap, "-onethread", "-noasyncloadingthread", "-playoffline", "-ResX=1280", "-ResY=720", "-windowed",
@@ -135,7 +137,7 @@ var Module = {
     "-nomovie", "-nostartupmovies"].concat(window.__wndrExtraArgs || []),
   print:   function(t){ console.log(t); if (t && /WNDR MDCDRAW|Bringing World .* up for play|Engine is initialized/.test(t)) { try { window.__revealGame && window.__revealGame(); } catch(e){} } },
   printErr:function(t){ console.error(t); if (t && /WNDR MDCDRAW|Bringing World .* up for play|Engine is initialized/.test(t)) { try { window.__revealGame && window.__revealGame(); } catch(e){} } },
-  locateFile: function(p, pre){ return (pre||"") + p; },
+  locateFile: function(p, pre){ if (window.__wndrPkgBase && /\.data$/.test(p)) return window.__wndrPkgBase + p; return (pre||"") + p; },
   onAbort: function(w){ console.error("ABORT: " + w); },
   setStatus: function(t){ if (t) console.log("STATUS: " + t); try { window.__updateLoading && window.__updateLoading(t); } catch(e){} },
   onRuntimeInitialized: function(){
