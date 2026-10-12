@@ -374,3 +374,15 @@ HUDDIAG-1..7, SKINDIAG-1, SKINWGSL-dump-1, BONEDIAG-1. Pollers: cdp_stagepoll2.m
 - Build box helper: /mnt/vms/ss-build/kick.sh restarts the wasm build (never pkill -f with a pattern that
   appears in your own ssh command line — it kills the ssh session). Wait for the rebuild script to EXIT
   (pgrep -f "bash [r]ebuild_wasm3.sh") before scp'ing the wasm, else you copy a truncated file.
+
+## Repos + package CDN (2026-10-12 late)
+- Code: github.com/ut4-hub/ut4-webgpu (PRIVATE). engine/ overlay (DawnRHI, SimplyStream src, modified
+  engine/UT files), build/, tools/, web/, deploy/, docs/. Release build-2026-10-12 = all hub files.
+- Packs: github.com/ut4-hub/ut4-webgpu-packages (PUBLIC), release packs-2026-10-12 = 12 .data files.
+- Worker ut4-packs (custom domain ut4-packs.pick.haus, also ut4-packs.lucaspick.workers.dev) proxies
+  /packs-<tag>/<name>.data -> release asset, manual redirect follow (redirect:'follow' gave CF error 1042),
+  adds ACAO * + CORP cross-origin. Deploy: cd ~/workspace/ut4-webgpu-packages/worker && npx wrangler deploy
+  (wrangler OAuth login done 2026-10-12; the tunnel cert token can NOT manage Workers).
+- Pages: window.__wndrPkgBase -> locateFile sends *.data to the Worker. Hub default = Worker
+  (?localpkgs=1 = homelab); local index.html default = local (?pkgs=cdn = Worker). Content change ->
+  new packs-<date> release + bump the tag in both pages.
